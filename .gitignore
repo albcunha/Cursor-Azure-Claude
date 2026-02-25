@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Reference projects (not part of this proxy)
+Cursor-Azure-GPT-5-main/
+cursor-openrouter-proxy-main/
+cursor-openrouter-proxy-main (1)/
+opencode-cursor-main/
+9router-master/
