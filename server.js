@@ -231,6 +231,13 @@ function convertToolChoiceToAnthropic(openaiToolChoice) {
     return undefined;
 }
 
+// THINKING_WITH_TOOLS controls whether thinking stays on when tools are present.
+// "off" (default): disable thinking when tools are in the request — most reliable for agentic use.
+//   The model uses 99-477 tokens for tool calls; thinking wastes budget and causes ~10% of
+//   requests to return end_turn (narrating actions) instead of actually executing tool calls.
+// "on": keep thinking enabled even with tools — deeper reasoning but less reliable tool execution.
+const THINKING_WITH_TOOLS = (process.env.THINKING_WITH_TOOLS || "off").toLowerCase();
+
 function shouldEnableThinking(modelName) {
     if (!modelName) return false;
     const lower = modelName.toLowerCase();
@@ -246,7 +253,7 @@ const THINKING_MAX_OUTPUT = 128000;
 // Beta header required to unlock 128K output on non-thinking requests
 const ANTHROPIC_BETA_FLAGS = "output-128k-2025-02-19";
 const MIN_OUTPUT_TOKENS = 16384;
-const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 15000;
+const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 10000;
 
 function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
     if (thinkingEnabled) return THINKING_MAX_OUTPUT;
@@ -259,8 +266,13 @@ function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
 
 function buildAnthropicRequest(openaiBody) {
     const { system, messages } = convertMessagesToAnthropic(openaiBody.messages || []);
-    const thinkingEnabled = shouldEnableThinking(openaiBody.model);
+    const thinkingRequested = shouldEnableThinking(openaiBody.model);
     const deployment = resolveDeployment(openaiBody.model);
+    const hasTools = openaiBody.tools && openaiBody.tools.length > 0;
+
+    // Disable thinking when tools are present (unless THINKING_WITH_TOOLS=on).
+    // Data shows thinking causes ~10% of tool-call requests to fail with end_turn.
+    const thinkingEnabled = thinkingRequested && (!hasTools || THINKING_WITH_TOOLS === "on");
 
     const anthropicReq = {
         model: deployment,
@@ -273,24 +285,20 @@ function buildAnthropicRequest(openaiBody) {
     if (openaiBody.stop) anthropicReq.stop_sequences = Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop];
 
     if (thinkingEnabled) {
-        // Keep thinking budget modest — high budgets (50K+) cause the model to
-        // overthink and describe actions in text instead of executing tool calls.
-        // Configurable via THINKING_BUDGET_TOKENS env var (default: 10000).
-        const budgetTokens = THINKING_BUDGET_TOKENS;
-        anthropicReq.thinking = { type: "enabled", budget_tokens: budgetTokens };
+        anthropicReq.thinking = { type: "enabled", budget_tokens: THINKING_BUDGET_TOKENS };
     } else {
         if (openaiBody.temperature !== undefined) anthropicReq.temperature = openaiBody.temperature;
         if (openaiBody.top_p !== undefined) anthropicReq.top_p = openaiBody.top_p;
     }
 
-    const tools = convertToolsToAnthropic(openaiBody.tools);
-    if (tools) {
-        anthropicReq.tools = tools;
-        // Ensure tool_choice is always set when tools are present —
-        // Cursor doesn't always send it, and without explicit "auto"
-        // the model may choose end_turn instead of making tool calls.
+    if (hasTools) {
+        anthropicReq.tools = convertToolsToAnthropic(openaiBody.tools);
         const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice);
         anthropicReq.tool_choice = toolChoice || { type: "auto" };
+
+        if (thinkingRequested && !thinkingEnabled) {
+            console.log(`[PROXY] Thinking disabled for this request (tools present, THINKING_WITH_TOOLS=${THINKING_WITH_TOOLS})`);
+        }
     }
 
     return anthropicReq;
@@ -632,10 +640,10 @@ async function handleChatCompletions(req, res) {
                 "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             };
-            // Beta flags: output-128k unlocks 128K output, interleaved-thinking
-            // allows thinking blocks between tool calls (critical for agentic use)
             const betaFlags = [ANTHROPIC_BETA_FLAGS];
-            if (anthropicRequest.thinking) betaFlags.push("interleaved-thinking-2025-05-14");
+            if (anthropicRequest.thinking && anthropicRequest.tools) {
+                betaFlags.push("interleaved-thinking-2025-05-14");
+            }
             reqHeaders["anthropic-beta"] = betaFlags.join(",");
 
             response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
@@ -871,6 +879,7 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Model Map: ${JSON.stringify(MODEL_MAP)}`);
     console.log(`Endpoint: ${CONFIG.AZURE_ENDPOINT}`);
     console.log(`Thinking Budget: ${THINKING_BUDGET_TOKENS} tokens (env THINKING_BUDGET_TOKENS)`);
+    console.log(`Thinking With Tools: ${THINKING_WITH_TOOLS} (env THINKING_WITH_TOOLS)`);
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
