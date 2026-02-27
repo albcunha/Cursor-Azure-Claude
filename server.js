@@ -220,15 +220,29 @@ function convertToolsToAnthropic(openaiTools) {
     });
 }
 
-function convertToolChoiceToAnthropic(openaiToolChoice) {
-    if (!openaiToolChoice) return undefined;
-    if (openaiToolChoice === "auto") return { type: "auto" };
-    if (openaiToolChoice === "required") return { type: "any" };
-    if (openaiToolChoice === "none") return undefined;
-    if (typeof openaiToolChoice === "object" && openaiToolChoice.type === "function") {
-        return { type: "tool", name: openaiToolChoice.function.name };
+function convertToolChoiceToAnthropic(openaiToolChoice, parallelToolCalls) {
+    let result;
+    if (!openaiToolChoice || openaiToolChoice === "auto") {
+        result = { type: "auto" };
+    } else if (openaiToolChoice === "required") {
+        result = { type: "any" };
+    } else if (openaiToolChoice === "none") {
+        return undefined;
+    } else if (typeof openaiToolChoice === "object" && openaiToolChoice.type === "function") {
+        result = { type: "tool", name: openaiToolChoice.function.name };
+    } else if (typeof openaiToolChoice === "object" && openaiToolChoice.type) {
+        result = { type: openaiToolChoice.type };
+        if (openaiToolChoice.type === "tool" && openaiToolChoice.name) result.name = openaiToolChoice.name;
+    } else {
+        return undefined;
     }
-    return undefined;
+    // Anthropic uses disable_parallel_tool_use (inverse of OpenAI's parallel_tool_calls)
+    if (parallelToolCalls === false) {
+        result.disable_parallel_tool_use = true;
+    } else if (parallelToolCalls === true) {
+        result.disable_parallel_tool_use = false;
+    }
+    return result;
 }
 
 // THINKING_WITH_TOOLS controls whether thinking stays on when tools are present.
@@ -296,7 +310,7 @@ function buildAnthropicRequest(openaiBody) {
 
     if (hasTools) {
         anthropicReq.tools = convertToolsToAnthropic(openaiBody.tools);
-        const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice);
+        const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice, openaiBody.parallel_tool_calls);
         anthropicReq.tool_choice = toolChoice || { type: "auto" };
 
         if (thinkingRequested && !thinkingEnabled) {
