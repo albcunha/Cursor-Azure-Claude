@@ -244,12 +244,11 @@ const MODEL_MAX_OUTPUT = {
 };
 const THINKING_MAX_OUTPUT = 128000;
 const MIN_OUTPUT_TOKENS = 16384;
+const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 10000;
 
 function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
     if (thinkingEnabled) return THINKING_MAX_OUTPUT;
     const modelMax = MODEL_MAX_OUTPUT[deployment] || 64000;
-    // Cursor often sends small defaults (4096) designed for GPT-4;
-    // Claude needs far more room for tool calls and refactoring operations.
     if (!openaiMaxTokens || openaiMaxTokens < MIN_OUTPUT_TOKENS) {
         return Math.min(modelMax, Math.max(MIN_OUTPUT_TOKENS, modelMax));
     }
@@ -272,10 +271,10 @@ function buildAnthropicRequest(openaiBody) {
     if (openaiBody.stop) anthropicReq.stop_sequences = Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop];
 
     if (thinkingEnabled) {
-        const budgetTokens = Math.min(
-            Math.floor(anthropicReq.max_tokens * 0.75),
-            100000
-        );
+        // Keep thinking budget modest — high budgets (50K+) cause the model to
+        // overthink and describe actions in text instead of executing tool calls.
+        // Configurable via THINKING_BUDGET_TOKENS env var (default: 10000).
+        const budgetTokens = THINKING_BUDGET_TOKENS;
         anthropicReq.thinking = { type: "enabled", budget_tokens: budgetTokens };
     } else {
         if (openaiBody.temperature !== undefined) anthropicReq.temperature = openaiBody.temperature;
@@ -612,7 +611,10 @@ async function handleChatCompletions(req, res) {
 
         const anthropicRequest = buildAnthropicRequest(req.body);
 
-        console.log(`[PROXY] model=${req.body.model} → ${anthropicRequest.model}, stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}, max_tokens=${anthropicRequest.max_tokens}${anthropicRequest.thinking ? ', thinking=enabled(budget=' + anthropicRequest.thinking.budget_tokens + ')' : ''}`);
+        console.log(`[PROXY] ── Request ──────────────────────────────────`);
+        console.log(`[PROXY] cursor_model=${req.body.model} → deployment=${anthropicRequest.model}`);
+        console.log(`[PROXY] cursor_max_tokens=${req.body.max_tokens || 'not set'} → actual_max_tokens=${anthropicRequest.max_tokens}`);
+        console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}${anthropicRequest.thinking ? ', thinking=enabled(budget=' + anthropicRequest.thinking.budget_tokens + ')' : ''}`);
         console.log(`[PROXY] Calling Azure endpoint...`);
 
         // Retry logic for transient errors (429 rate limit, 529 overloaded)
@@ -666,8 +668,12 @@ async function handleChatCompletions(req, res) {
         if (isStreaming) {
             handleAnthropicStream(response, res, req.body.model, abortController, true);
         } else {
+            const anthropicStopReason = response.data?.stop_reason;
             const openaiResponse = convertAnthropicResponseToOpenai(response.data, req.body.model);
-            console.log(`[RESPONSE] finish_reason=${openaiResponse.choices[0].finish_reason}, tool_calls=${openaiResponse.choices[0].message.tool_calls?.length || 0}`);
+            console.log(`[RESPONSE] anthropic_stop=${anthropicStopReason} → finish_reason=${openaiResponse.choices[0].finish_reason}, tool_calls=${openaiResponse.choices[0].message.tool_calls?.length || 0}, usage=${JSON.stringify(openaiResponse.usage)}`);
+            if (anthropicStopReason === "max_tokens") {
+                console.log(`[RESPONSE] ⚠️  OUTPUT TRUNCATED — model hit max_tokens. cursor_max_tokens=${req.body.max_tokens || 'not set'}, actual=${anthropicRequest.max_tokens}`);
+            }
             res.json(openaiResponse);
         }
     } catch (error) {
@@ -845,6 +851,8 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Default Deployment: ${DEFAULT_DEPLOYMENT}`);
     console.log(`Model Map: ${JSON.stringify(MODEL_MAP)}`);
     console.log(`Endpoint: ${CONFIG.AZURE_ENDPOINT}`);
+    console.log(`Thinking Budget: ${THINKING_BUDGET_TOKENS} tokens (env THINKING_BUDGET_TOKENS)`);
+    console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
     console.log("=".repeat(60));

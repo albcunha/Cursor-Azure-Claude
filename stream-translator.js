@@ -170,11 +170,18 @@ function translateClaudeEvent(event, state) {
             }
 
             if (event.delta?.stop_reason) {
-                state.finishReason = convertStopReason(event.delta.stop_reason);
+                const rawStopReason = event.delta.stop_reason;
+                state.finishReason = convertStopReason(rawStopReason);
                 // Override: if we emitted tool calls but stop_reason is "end_turn",
                 // Cursor needs "tool_calls" to trigger tool execution
                 if (state.finishReason === "stop" && state.toolCalls.size > 0) {
                     state.finishReason = "tool_calls";
+                }
+
+                const outputTokens = event.usage?.output_tokens || state.usage?.output_tokens || '?';
+                console.log(`[STREAM] ⚡ stop_reason=${rawStopReason} → finish_reason=${state.finishReason}, output_tokens=${outputTokens}, tool_calls=${state.toolCalls.size}`);
+                if (rawStopReason === "max_tokens") {
+                    console.log(`[STREAM] ⚠️  OUTPUT TRUNCATED — model hit max_tokens limit. Increase max_tokens or check resolveMaxTokens().`);
                 }
 
                 const finalChunk = {
