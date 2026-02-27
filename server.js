@@ -284,10 +284,14 @@ function buildAnthropicRequest(openaiBody) {
     }
 
     const tools = convertToolsToAnthropic(openaiBody.tools);
-    if (tools) anthropicReq.tools = tools;
-
-    const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice);
-    if (toolChoice) anthropicReq.tool_choice = toolChoice;
+    if (tools) {
+        anthropicReq.tools = tools;
+        // Ensure tool_choice is always set when tools are present —
+        // Cursor doesn't always send it, and without explicit "auto"
+        // the model may choose end_turn instead of making tool calls.
+        const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice);
+        anthropicReq.tool_choice = toolChoice || { type: "auto" };
+    }
 
     return anthropicReq;
 }
@@ -616,19 +620,26 @@ async function handleChatCompletions(req, res) {
         console.log(`[PROXY] ── Request ──────────────────────────────────`);
         console.log(`[PROXY] cursor_model=${req.body.model} → deployment=${anthropicRequest.model}`);
         console.log(`[PROXY] cursor_max_tokens=${req.body.max_tokens || 'not set'} → actual_max_tokens=${anthropicRequest.max_tokens}`);
-        console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}${anthropicRequest.thinking ? ', thinking=enabled(budget=' + anthropicRequest.thinking.budget_tokens + ')' : ''}`);
+        console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}, tool_choice=${JSON.stringify(anthropicRequest.tool_choice || 'none')}${anthropicRequest.thinking ? ', thinking=enabled(budget=' + anthropicRequest.thinking.budget_tokens + ')' : ''}`);
         console.log(`[PROXY] Calling Azure endpoint...`);
 
         // Retry logic for transient errors (429 rate limit, 529 overloaded)
         const MAX_RETRIES = 3;
         let response;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            const reqHeaders = {
+                "Content-Type": "application/json",
+                "x-api-key": CONFIG.AZURE_API_KEY,
+                "anthropic-version": CONFIG.ANTHROPIC_VERSION,
+            };
+            // Beta flags: output-128k unlocks 128K output, interleaved-thinking
+            // allows thinking blocks between tool calls (critical for agentic use)
+            const betaFlags = [ANTHROPIC_BETA_FLAGS];
+            if (anthropicRequest.thinking) betaFlags.push("interleaved-thinking-2025-05-14");
+            reqHeaders["anthropic-beta"] = betaFlags.join(",");
+
             response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": CONFIG.AZURE_API_KEY,
-                    "anthropic-version": CONFIG.ANTHROPIC_VERSION,
-                },
+                headers: reqHeaders,
                 timeout: 300000,
                 responseType: isStreaming ? "stream" : "json",
                 validateStatus: (status) => status < 600,
@@ -787,12 +798,18 @@ app.post("/v1/messages", requireAuth, async (req, res) => {
     });
 
     try {
+        const passthroughHeaders = {
+            "Content-Type": "application/json",
+            "x-api-key": CONFIG.AZURE_API_KEY,
+            "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
+        };
+        if (req.headers["anthropic-beta"]) {
+            passthroughHeaders["anthropic-beta"] = req.headers["anthropic-beta"];
+        } else {
+            passthroughHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
+        }
         const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
-            headers: {
-                "Content-Type": "application/json",
-                "x-api-key": CONFIG.AZURE_API_KEY,
-                "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
-            },
+            headers: passthroughHeaders,
             timeout: 300000,
             responseType: isStreaming ? "stream" : "json",
             signal: abortController.signal,
