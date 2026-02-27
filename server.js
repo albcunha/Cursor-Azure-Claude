@@ -236,7 +236,7 @@ function convertToolChoiceToAnthropic(openaiToolChoice) {
 //   The model uses 99-477 tokens for tool calls; thinking wastes budget and causes ~10% of
 //   requests to return end_turn (narrating actions) instead of actually executing tool calls.
 // "on": keep thinking enabled even with tools — deeper reasoning but less reliable tool execution.
-const THINKING_WITH_TOOLS = (process.env.THINKING_WITH_TOOLS || "off").toLowerCase();
+const THINKING_WITH_TOOLS = (process.env.THINKING_WITH_TOOLS || "on").toLowerCase();
 
 function shouldEnableThinking(modelName) {
     if (!modelName) return false;
@@ -245,13 +245,16 @@ function shouldEnableThinking(modelName) {
 }
 
 const MODEL_MAX_OUTPUT = {
-    "claude-opus-4-6": 128000,
-    "claude-sonnet-4-6": 128000,
-    "claude-haiku-3-5": 64000,
+    "claude-opus-4-6": 32000,
+    "claude-sonnet-4-6": 64000,
+    "claude-haiku-3-5": 8192,
 };
+// With thinking enabled, 128K is natively supported (no beta header needed)
 const THINKING_MAX_OUTPUT = 128000;
-// Beta header required to unlock 128K output on non-thinking requests
-const ANTHROPIC_BETA_FLAGS = "output-128k-2025-02-19";
+// Azure AI supported beta headers (from LiteLLM's anthropic_beta_headers_config.json).
+// NOT supported on Azure: output-128k, token-efficient-tools, fine-grained-tool-streaming,
+// compact, fast-mode. Sending unsupported headers can cause silent failures.
+const AZURE_SUPPORTED_BETA_FLAGS = [];
 const MIN_OUTPUT_TOKENS = 16384;
 const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 10000;
 
@@ -637,14 +640,17 @@ async function handleChatCompletions(req, res) {
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             const reqHeaders = {
                 "Content-Type": "application/json",
-                "x-api-key": CONFIG.AZURE_API_KEY,
+                "api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             };
-            const betaFlags = [ANTHROPIC_BETA_FLAGS];
+            // Build beta flags from Azure-supported list + conditional flags
+            const betaFlags = [...AZURE_SUPPORTED_BETA_FLAGS];
             if (anthropicRequest.thinking && anthropicRequest.tools) {
                 betaFlags.push("interleaved-thinking-2025-05-14");
             }
-            reqHeaders["anthropic-beta"] = betaFlags.join(",");
+            if (betaFlags.length > 0) {
+                reqHeaders["anthropic-beta"] = betaFlags.join(",");
+            }
 
             response = await axios.post(CONFIG.AZURE_ENDPOINT, anthropicRequest, {
                 headers: reqHeaders,
@@ -808,13 +814,11 @@ app.post("/v1/messages", requireAuth, async (req, res) => {
     try {
         const passthroughHeaders = {
             "Content-Type": "application/json",
-            "x-api-key": CONFIG.AZURE_API_KEY,
+            "api-key": CONFIG.AZURE_API_KEY,
             "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
         };
         if (req.headers["anthropic-beta"]) {
             passthroughHeaders["anthropic-beta"] = req.headers["anthropic-beta"];
-        } else {
-            passthroughHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
         }
         const response = await axios.post(CONFIG.AZURE_ENDPOINT, req.body, {
             headers: passthroughHeaders,
