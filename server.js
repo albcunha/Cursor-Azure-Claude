@@ -238,13 +238,15 @@ function shouldEnableThinking(modelName) {
 }
 
 const MODEL_MAX_OUTPUT = {
-    "claude-opus-4-6": 32000,
-    "claude-sonnet-4-6": 64000,
-    "claude-haiku-3-5": 8192,
+    "claude-opus-4-6": 128000,
+    "claude-sonnet-4-6": 128000,
+    "claude-haiku-3-5": 64000,
 };
 const THINKING_MAX_OUTPUT = 128000;
+// Beta header required to unlock 128K output on non-thinking requests
+const ANTHROPIC_BETA_FLAGS = "output-128k-2025-02-19";
 const MIN_OUTPUT_TOKENS = 16384;
-const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 10000;
+const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 15000;
 
 function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
     if (thinkingEnabled) return THINKING_MAX_OUTPUT;
