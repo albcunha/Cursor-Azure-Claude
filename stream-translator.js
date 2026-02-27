@@ -32,7 +32,10 @@ function createStreamState(model) {
         usage: null,
         inThinkingBlock: false,
         currentBlockIndex: -1,
+        currentBlockType: null,
         serverToolBlockIndex: -1,
+        lastChunkHash: null,
+        duplicateCount: 0,
     };
 }
 
@@ -52,8 +55,8 @@ function translateClaudeEvent(event, state) {
                 state.usage = { input_tokens: event.message.usage.input_tokens, output_tokens: 0 };
             }
 
-            // Role-only chunk, NO content field (critical for Cursor tool call detection)
-            results.push(createChunk(state, { role: "assistant" }));
+            // OpenAI format: first chunk always has role + content:null
+            results.push(createChunk(state, { role: "assistant", content: null }));
             break;
         }
 
@@ -61,16 +64,16 @@ function translateClaudeEvent(event, state) {
             const block = event.content_block;
             if (!block) break;
 
+            state.currentBlockType = block.type;
+            state.currentBlockIndex = event.index;
+
             if (block.type === "server_tool_use") {
                 state.serverToolBlockIndex = event.index;
                 break;
             }
 
-            if (block.type === "text") {
-                // Nothing to emit on text block start
-            } else if (block.type === "thinking" || block.type === "redacted_thinking") {
+            if (block.type === "thinking" || block.type === "redacted_thinking") {
                 state.inThinkingBlock = true;
-                state.currentBlockIndex = event.index;
             } else if (block.type === "tool_use") {
                 const toolCallIndex = state.toolCallIndex++;
                 const toolCall = {
@@ -78,9 +81,18 @@ function translateClaudeEvent(event, state) {
                     id: block.id,
                     type: "function",
                     function: { name: block.name, arguments: "" },
+                    _hasReceivedArgs: false,
                 };
                 state.toolCalls.set(event.index, toolCall);
-                results.push(createChunk(state, { tool_calls: [toolCall] }));
+                // First chunk for this tool call includes id, type, and name
+                results.push(createChunk(state, {
+                    tool_calls: [{
+                        index: toolCallIndex,
+                        id: block.id,
+                        type: "function",
+                        function: { name: block.name, arguments: "" },
+                    }],
+                }));
             }
             break;
         }
@@ -92,6 +104,15 @@ function translateClaudeEvent(event, state) {
             if (!delta) break;
 
             if (delta.type === "text_delta" && delta.text) {
+                // Dedup protection: skip identical consecutive text chunks
+                const hash = delta.text;
+                if (hash === state.lastChunkHash) {
+                    state.duplicateCount++;
+                    if (state.duplicateCount > 3) break;
+                } else {
+                    state.lastChunkHash = hash;
+                    state.duplicateCount = 0;
+                }
                 results.push(createChunk(state, { content: delta.text }));
             } else if (delta.type === "thinking_delta" && delta.thinking) {
                 results.push(createChunk(state, { reasoning_content: delta.thinking }));
@@ -99,10 +120,11 @@ function translateClaudeEvent(event, state) {
                 const toolCall = state.toolCalls.get(event.index);
                 if (toolCall) {
                     toolCall.function.arguments += delta.partial_json;
+                    toolCall._hasReceivedArgs = true;
+                    // Delta chunks: only index + argument fragment (no id/type/name)
                     results.push(createChunk(state, {
                         tool_calls: [{
                             index: toolCall.index,
-                            id: toolCall.id,
                             function: { arguments: delta.partial_json },
                         }],
                     }));
@@ -114,11 +136,24 @@ function translateClaudeEvent(event, state) {
         case "content_block_stop": {
             if (event.index === state.serverToolBlockIndex) {
                 state.serverToolBlockIndex = -1;
+                state.currentBlockType = null;
                 break;
+            }
+            // Emit valid empty args for parameterless tool calls (LiteLLM pattern)
+            const stoppedToolCall = state.toolCalls.get(event.index);
+            if (stoppedToolCall && !stoppedToolCall._hasReceivedArgs) {
+                stoppedToolCall.function.arguments = "{}";
+                results.push(createChunk(state, {
+                    tool_calls: [{
+                        index: stoppedToolCall.index,
+                        function: { arguments: "{}" },
+                    }],
+                }));
             }
             if (state.inThinkingBlock && event.index === state.currentBlockIndex) {
                 state.inThinkingBlock = false;
             }
+            state.currentBlockType = null;
             break;
         }
 
@@ -136,6 +171,11 @@ function translateClaudeEvent(event, state) {
 
             if (event.delta?.stop_reason) {
                 state.finishReason = convertStopReason(event.delta.stop_reason);
+                // Override: if we emitted tool calls but stop_reason is "end_turn",
+                // Cursor needs "tool_calls" to trigger tool execution
+                if (state.finishReason === "stop" && state.toolCalls.size > 0) {
+                    state.finishReason = "tool_calls";
+                }
 
                 const finalChunk = {
                     id: `chatcmpl-${state.messageId}`,

@@ -237,14 +237,34 @@ function shouldEnableThinking(modelName) {
     return lower.includes("thinking") || lower.includes("think");
 }
 
+const MODEL_MAX_OUTPUT = {
+    "claude-opus-4-6": 32000,
+    "claude-sonnet-4-6": 64000,
+    "claude-haiku-3-5": 8192,
+};
+const THINKING_MAX_OUTPUT = 128000;
+const MIN_OUTPUT_TOKENS = 16384;
+
+function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
+    if (thinkingEnabled) return THINKING_MAX_OUTPUT;
+    const modelMax = MODEL_MAX_OUTPUT[deployment] || 64000;
+    // Cursor often sends small defaults (4096) designed for GPT-4;
+    // Claude needs far more room for tool calls and refactoring operations.
+    if (!openaiMaxTokens || openaiMaxTokens < MIN_OUTPUT_TOKENS) {
+        return Math.min(modelMax, Math.max(MIN_OUTPUT_TOKENS, modelMax));
+    }
+    return Math.min(openaiMaxTokens, modelMax);
+}
+
 function buildAnthropicRequest(openaiBody) {
     const { system, messages } = convertMessagesToAnthropic(openaiBody.messages || []);
     const thinkingEnabled = shouldEnableThinking(openaiBody.model);
+    const deployment = resolveDeployment(openaiBody.model);
 
     const anthropicReq = {
-        model: resolveDeployment(openaiBody.model),
+        model: deployment,
         messages,
-        max_tokens: openaiBody.max_tokens || (thinkingEnabled ? 128000 : 64000),
+        max_tokens: resolveMaxTokens(openaiBody.max_tokens, deployment, thinkingEnabled),
     };
 
     if (system) anthropicReq.system = system;
@@ -252,11 +272,10 @@ function buildAnthropicRequest(openaiBody) {
     if (openaiBody.stop) anthropicReq.stop_sequences = Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop];
 
     if (thinkingEnabled) {
-        const budgetTokens = 10000;
-        // max_tokens must be strictly greater than budget_tokens
-        if (anthropicReq.max_tokens <= budgetTokens) {
-            anthropicReq.max_tokens = budgetTokens + 16384;
-        }
+        const budgetTokens = Math.min(
+            Math.floor(anthropicReq.max_tokens * 0.75),
+            100000
+        );
         anthropicReq.thinking = { type: "enabled", budget_tokens: budgetTokens };
     } else {
         if (openaiBody.temperature !== undefined) anthropicReq.temperature = openaiBody.temperature;
@@ -330,6 +349,8 @@ function writeChunk(res, chunk) {
     }
 }
 
+const MAX_STREAM_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
 function handleAnthropicStream(axiosResponse, res, requestModel, abortController, headersAlreadySent = false) {
     if (!headersAlreadySent) {
         res.setHeader("Content-Type", "text/event-stream");
@@ -340,14 +361,31 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
     }
 
     const state = createStreamState(requestModel || DEFAULT_DEPLOYMENT);
+    const streamStart = Date.now();
     let buffer = "";
     let streamEnded = false;
     let streamCompleted = false;
+    let lastActivityTime = Date.now();
 
     const heartbeatInterval = setInterval(() => {
-        if (!streamEnded && !res.writableEnded) {
-            try { res.write(": heartbeat\n\n"); } catch { cleanup(); }
+        if (streamEnded || res.writableEnded) return;
+
+        const elapsed = Date.now() - streamStart;
+        if (elapsed > MAX_STREAM_DURATION_MS) {
+            console.log(`[STREAM] Max duration reached (${elapsed}ms), closing`);
+            writeSSEError(res, "Stream exceeded maximum duration", "timeout_error");
+            cleanup();
+            return;
         }
+
+        const idleTime = Date.now() - lastActivityTime;
+        if (idleTime > 120000) {
+            console.log(`[STREAM] Idle for ${idleTime}ms, closing`);
+            cleanup();
+            return;
+        }
+
+        try { res.write(": heartbeat\n\n"); } catch { cleanup(); }
     }, 15000);
 
     function cleanup() {
@@ -371,6 +409,7 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
 
     axiosResponse.data.on("data", (chunk) => {
         if (streamEnded) return;
+        lastActivityTime = Date.now();
 
         buffer += chunk.toString();
         const lines = buffer.split("\n");
@@ -391,7 +430,6 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
 
             const data = trimmed.slice(5).trim();
             if (data === "[DONE]") {
-                try { res.write("data: [DONE]\n\n"); } catch {}
                 currentEventType = null;
                 continue;
             }
@@ -402,6 +440,16 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
             if (currentEventType) {
                 event.type = currentEventType;
                 currentEventType = null;
+            }
+
+            // Handle errors embedded in the stream
+            if (event.type === "error") {
+                console.error(`[STREAM] Error event:`, event.error?.message || JSON.stringify(event));
+                if (!res.writableEnded) {
+                    writeSSEError(res, event.error?.message || "Stream error from upstream");
+                }
+                cleanup();
+                return;
             }
 
             const chunks = translateClaudeEvent(event, state);
@@ -423,13 +471,28 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
 
     axiosResponse.data.on("end", () => {
         console.log("[STREAM] Upstream ended");
+        if (!streamCompleted && !streamEnded && !res.writableEnded) {
+            // Upstream closed without message_stop — send a graceful termination
+            if (!state.finishReasonSent) {
+                const finishReason = state.toolCalls.size > 0 ? "tool_calls" : "stop";
+                writeChunk(res, {
+                    id: `chatcmpl-${state.messageId}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: state.model,
+                    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                });
+                console.log(`[STREAM] Synthesized finish_reason=${finishReason} (upstream ended without message_stop)`);
+            }
+            try { res.write("data: [DONE]\n\n"); } catch {}
+        }
         cleanup();
     });
 
     axiosResponse.data.on("error", (error) => {
         console.error("[STREAM] Error:", error.message);
-        if (!res.headersSent) {
-            res.status(500).json({ error: { message: "Stream error: " + error.message, type: "stream_error" } });
+        if (!res.writableEnded) {
+            writeSSEError(res, "Stream error: " + error.message);
         }
         cleanup();
     });
@@ -438,15 +501,14 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
 // ─── Chat Completions Handler ────────────────────────────────────────────────
 
 function isModelValidationPing(body) {
-    // Only intercept truly trivial pings: non-streaming, no tools, exactly 1 short message
     if (body.stream === true) return false;
     if (body.tools && body.tools.length > 0) return false;
     if (body.tool_choice) return false;
     const msgs = body.messages || [];
     if (msgs.length !== 1) return false;
-    // Only if the single message is very short (likely "hi", "ping", "test", etc.)
     const content = msgs[0]?.content;
-    if (typeof content === "string" && content.length > 100) return false;
+    if (typeof content !== "string") return false;
+    if (content.length > 50) return false;
     return true;
 }
 
