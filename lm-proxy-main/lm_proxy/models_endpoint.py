@@ -1,0 +1,49 @@
+"""
+Models list endpoint
+"""
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from .bootstrap import env
+from .core import check, parse_routing_rule, fail_if_service_disabled
+from .config import ModelListingMode, Group
+
+
+async def models(request: Request) -> JSONResponse:
+    """
+    Lists available models based on routing rules and group permissions.
+    """
+    fail_if_service_disabled()
+    group_name, api_key, user_info = await check(request)
+    group: Group = env.config.groups[group_name]
+    models_list = []
+    for model_pattern, route in env.config.routing.items():
+        connection_name, _ = parse_routing_rule(route, env.config)
+        if group.allows_connecting_to(connection_name):
+            is_model_name = not ("*" in model_pattern or "?" in model_pattern)
+            if not is_model_name:
+                if env.config.model_listing_mode != ModelListingMode.AS_IS:
+                    if env.config.model_listing_mode == ModelListingMode.IGNORE_WILDCARDS:
+                        continue
+                    raise NotImplementedError(
+                        f"'{env.config.model_listing_mode}' model listing mode "
+                        f"is not implemented yet"
+                    )
+            model_data = {
+                "id": model_pattern,
+                "object": "model",
+                "created": 0,
+                "owned_by": connection_name,
+            }
+
+            if aux_info := env.config.model_info.get(model_pattern):
+                model_data.update(aux_info)
+            models_list.append(model_data)
+
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": models_list,
+        }
+    )

@@ -1,0 +1,13 @@
+__pycache__
+.idea/
+venv
+.env*
+!.env.template
+.pytest_cache
+storage
+dist
+docs
+.aico/*
+!.aico/project.json
+.coverage
+coverage.xml

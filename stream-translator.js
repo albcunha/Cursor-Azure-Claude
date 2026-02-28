@@ -243,4 +243,4 @@ function translateClaudeEvent(event, state) {
     return results.length > 0 ? results : null;
 }
 
-module.exports = { createStreamState, translateClaudeEvent, convertStopReason };
+module.exports = { createStreamState, translateClaudeEvent, convertStopReason, createChunk };

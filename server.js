@@ -1,6 +1,6 @@
 const express = require("express");
 const axios = require("axios");
-const { createStreamState, translateClaudeEvent } = require("./stream-translator");
+const { createStreamState, translateClaudeEvent, createChunk } = require("./stream-translator");
 
 const app = express();
 app.use(express.json({ limit: "250mb" }));
@@ -246,10 +246,10 @@ function convertToolChoiceToAnthropic(openaiToolChoice, parallelToolCalls) {
 }
 
 // THINKING_WITH_TOOLS controls whether thinking stays on when tools are present.
-// "off" (default): disable thinking when tools are in the request — most reliable for agentic use.
-//   The model uses 99-477 tokens for tool calls; thinking wastes budget and causes ~10% of
-//   requests to return end_turn (narrating actions) instead of actually executing tool calls.
-// "on": keep thinking enabled even with tools — deeper reasoning but less reliable tool execution.
+// "on" (default): keep thinking enabled even with tools — deeper reasoning at cost of occasional
+//   end_turn instead of tool execution (~10%). The finish_reason override in both streaming
+//   (stream-translator.js) and non-streaming (convertAnthropicResponseToOpenai) paths mitigates this.
+// "off": disable thinking when tools are in the request — most reliable for agentic use.
 const THINKING_WITH_TOOLS = (process.env.THINKING_WITH_TOOLS || "on").toLowerCase();
 
 function shouldEnableThinking(modelName) {
@@ -286,15 +286,16 @@ function buildAnthropicRequest(openaiBody) {
     const thinkingRequested = shouldEnableThinking(openaiBody.model);
     const deployment = resolveDeployment(openaiBody.model);
     const hasTools = openaiBody.tools && openaiBody.tools.length > 0;
+    const toolChoiceIsNone = openaiBody.tool_choice === "none";
+    const effectiveHasTools = hasTools && !toolChoiceIsNone;
 
-    // Disable thinking when tools are present (unless THINKING_WITH_TOOLS=on).
-    // Data shows thinking causes ~10% of tool-call requests to fail with end_turn.
-    const thinkingEnabled = thinkingRequested && (!hasTools || THINKING_WITH_TOOLS === "on");
+    const thinkingEnabled = thinkingRequested && (!effectiveHasTools || THINKING_WITH_TOOLS === "on");
 
+    const maxTokensFromClient = openaiBody.max_tokens || openaiBody.max_completion_tokens;
     const anthropicReq = {
         model: deployment,
         messages,
-        max_tokens: resolveMaxTokens(openaiBody.max_tokens, deployment, thinkingEnabled),
+        max_tokens: resolveMaxTokens(maxTokensFromClient, deployment, thinkingEnabled),
     };
 
     if (system) anthropicReq.system = system;
@@ -308,7 +309,7 @@ function buildAnthropicRequest(openaiBody) {
         if (openaiBody.top_p !== undefined) anthropicReq.top_p = openaiBody.top_p;
     }
 
-    if (hasTools) {
+    if (effectiveHasTools) {
         anthropicReq.tools = convertToolsToAnthropic(openaiBody.tools);
         const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice, openaiBody.parallel_tool_calls);
         anthropicReq.tool_choice = toolChoice || { type: "auto" };
@@ -355,12 +356,19 @@ function convertAnthropicResponseToOpenai(anthropicResp, requestModel) {
     const message = { role: "assistant", content: textParts.length > 0 ? textParts.join("") : null };
     if (toolCalls.length > 0) message.tool_calls = toolCalls;
 
+    let finishReason = anthropicStopToOpenai(anthropicResp.stop_reason);
+    // Claude sometimes returns "end_turn" even when tool_use blocks are present;
+    // Cursor needs "tool_calls" to trigger tool execution
+    if (finishReason === "stop" && toolCalls.length > 0) {
+        finishReason = "tool_calls";
+    }
+
     return {
         id: anthropicResp.id || "chatcmpl-" + Date.now(),
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: requestModel || DEFAULT_DEPLOYMENT,
-        choices: [{ index: 0, message, finish_reason: anthropicStopToOpenai(anthropicResp.stop_reason) }],
+        choices: [{ index: 0, message, finish_reason: finishReason }],
         usage: {
             prompt_tokens: anthropicResp.usage?.input_tokens || 0,
             completion_tokens: anthropicResp.usage?.output_tokens || 0,
@@ -380,6 +388,35 @@ function writeChunk(res, chunk) {
 }
 
 const MAX_STREAM_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
+// Attempts to close truncated JSON by appending missing quotes/brackets/braces.
+// Returns the suffix to append, or null if the JSON is already valid or unrepairable.
+// Needed because Anthropic streams can be cut off mid-tool-argument
+// (see github.com/anthropics/anthropic-sdk-typescript/issues/842).
+function repairTruncatedJSON(str) {
+    if (!str) return "{}";
+    try { JSON.parse(str); return null; } catch {}
+
+    let inStr = false, esc = false;
+    const stack = [];
+    for (const ch of str) {
+        if (esc) { esc = false; continue; }
+        if (ch === '\\' && inStr) { esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{') stack.push('}');
+        else if (ch === '[') stack.push(']');
+        else if ((ch === '}' || ch === ']') && stack.length) stack.pop();
+    }
+    const close = stack.reverse().join('');
+    const candidates = inStr
+        ? [`"${close}`, `":null${close}`]
+        : [close, `null${close}`, `"_":null${close}`];
+    for (const fix of candidates) {
+        try { JSON.parse(str + fix); return fix; } catch {}
+    }
+    return null;
+}
 
 function handleAnthropicStream(axiosResponse, res, requestModel, abortController, headersAlreadySent = false) {
     if (!headersAlreadySent) {
@@ -501,8 +538,50 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
 
     axiosResponse.data.on("end", () => {
         console.log("[STREAM] Upstream ended");
+
+        // Flush remaining buffer — may contain complete SSE events without trailing \n
+        if (buffer.trim()) {
+            const remaining = buffer;
+            buffer = "";
+            for (const line of remaining.split("\n")) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith("data:")) continue;
+                const data = trimmed.slice(5).trim();
+                if (data === "[DONE]") continue;
+                try {
+                    const event = JSON.parse(data);
+                    const chunks = translateClaudeEvent(event, state);
+                    if (chunks) {
+                        for (const c of chunks) writeChunk(res, c);
+                    }
+                    if (event.type === "message_stop") {
+                        streamCompleted = true;
+                        try { res.write("data: [DONE]\n\n"); } catch {}
+                    }
+                } catch {}
+            }
+        }
+
         if (!streamCompleted && !streamEnded && !res.writableEnded) {
-            // Upstream closed without message_stop — send a graceful termination
+            // Upstream closed without message_stop — known Anthropic streaming bug
+            // that truncates tool call arguments mid-transmission
+            // (see github.com/anthropics/anthropic-sdk-typescript/issues/842).
+            // Repair truncated tool arguments so Cursor receives valid JSON.
+            if (state.toolCalls.size > 0) {
+                for (const [, toolCall] of state.toolCalls) {
+                    const repair = repairTruncatedJSON(toolCall.function.arguments);
+                    if (repair) {
+                        console.log(`[STREAM] ⚠️  Repairing truncated tool_call[${toolCall.index}] "${toolCall.function.name}" — appending: ${repair}`);
+                        writeChunk(res, createChunk(state, {
+                            tool_calls: [{
+                                index: toolCall.index,
+                                function: { arguments: repair },
+                            }],
+                        }));
+                    }
+                }
+            }
+
             if (!state.finishReasonSent) {
                 const finishReason = state.toolCalls.size > 0 ? "tool_calls" : "stop";
                 writeChunk(res, {
@@ -644,7 +723,7 @@ async function handleChatCompletions(req, res) {
 
         console.log(`[PROXY] ── Request ──────────────────────────────────`);
         console.log(`[PROXY] cursor_model=${req.body.model} → deployment=${anthropicRequest.model}`);
-        console.log(`[PROXY] cursor_max_tokens=${req.body.max_tokens || 'not set'} → actual_max_tokens=${anthropicRequest.max_tokens}`);
+        console.log(`[PROXY] cursor_max_tokens=${req.body.max_tokens || req.body.max_completion_tokens || 'not set'} → actual_max_tokens=${anthropicRequest.max_tokens}`);
         console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}, tool_choice=${JSON.stringify(anthropicRequest.tool_choice || 'none')}${anthropicRequest.thinking ? ', thinking=enabled(budget=' + anthropicRequest.thinking.budget_tokens + ')' : ''}`);
         console.log(`[PROXY] Calling Azure endpoint...`);
 
