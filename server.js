@@ -245,13 +245,6 @@ function convertToolChoiceToAnthropic(openaiToolChoice, parallelToolCalls) {
     return result;
 }
 
-// THINKING_WITH_TOOLS controls whether thinking stays on when tools are present.
-// "on" (default): keep thinking enabled even with tools — deeper reasoning at cost of occasional
-//   end_turn instead of tool execution (~10%). The finish_reason override in both streaming
-//   (stream-translator.js) and non-streaming (convertAnthropicResponseToOpenai) paths mitigates this.
-// "off": disable thinking when tools are in the request — most reliable for agentic use.
-const THINKING_WITH_TOOLS = (process.env.THINKING_WITH_TOOLS || "on").toLowerCase();
-
 function shouldEnableThinking(modelName) {
     if (!modelName) return false;
     const lower = modelName.toLowerCase();
