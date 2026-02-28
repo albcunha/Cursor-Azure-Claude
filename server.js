@@ -270,7 +270,9 @@ const THINKING_MAX_OUTPUT = 128000;
 // compact, fast-mode. Sending unsupported headers can cause silent failures.
 const AZURE_SUPPORTED_BETA_FLAGS = [];
 const MIN_OUTPUT_TOKENS = 16384;
-const THINKING_BUDGET_TOKENS = parseInt(process.env.THINKING_BUDGET_TOKENS) || 10000;
+// Adaptive thinking (Opus 4.6+) — no budget_tokens needed, the model decides autonomously.
+// Effort level controls how much thinking the model does: "high" (default), "medium", "low".
+const THINKING_EFFORT = (process.env.THINKING_EFFORT || "high").toLowerCase();
 
 function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
     if (thinkingEnabled) return THINKING_MAX_OUTPUT;
@@ -303,7 +305,8 @@ function buildAnthropicRequest(openaiBody) {
     if (openaiBody.stop) anthropicReq.stop_sequences = Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop];
 
     if (thinkingEnabled) {
-        anthropicReq.thinking = { type: "enabled", budget_tokens: THINKING_BUDGET_TOKENS };
+        anthropicReq.thinking = { type: "adaptive" };
+        anthropicReq.output_config = { effort: THINKING_EFFORT };
     } else {
         if (openaiBody.temperature !== undefined) anthropicReq.temperature = openaiBody.temperature;
         if (openaiBody.top_p !== undefined) anthropicReq.top_p = openaiBody.top_p;
@@ -724,7 +727,7 @@ async function handleChatCompletions(req, res) {
         console.log(`[PROXY] ── Request ──────────────────────────────────`);
         console.log(`[PROXY] cursor_model=${req.body.model} → deployment=${anthropicRequest.model}`);
         console.log(`[PROXY] cursor_max_tokens=${req.body.max_tokens || req.body.max_completion_tokens || 'not set'} → actual_max_tokens=${anthropicRequest.max_tokens}`);
-        console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}, tool_choice=${JSON.stringify(anthropicRequest.tool_choice || 'none')}${anthropicRequest.thinking ? ', thinking=enabled(budget=' + anthropicRequest.thinking.budget_tokens + ')' : ''}`);
+        console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}, tool_choice=${JSON.stringify(anthropicRequest.tool_choice || 'none')}${anthropicRequest.thinking ? ', thinking=adaptive(effort=' + (anthropicRequest.output_config?.effort || 'high') + ')' : ''}`);
         console.log(`[PROXY] Calling Azure endpoint...`);
 
         // Retry logic for transient errors (429 rate limit, 529 overloaded)
@@ -975,7 +978,7 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Default Deployment: ${DEFAULT_DEPLOYMENT}`);
     console.log(`Model Map: ${JSON.stringify(MODEL_MAP)}`);
     console.log(`Endpoint: ${CONFIG.AZURE_ENDPOINT}`);
-    console.log(`Thinking Budget: ${THINKING_BUDGET_TOKENS} tokens (env THINKING_BUDGET_TOKENS)`);
+    console.log(`Thinking: adaptive (effort=${THINKING_EFFORT}, env THINKING_EFFORT)`);
     console.log(`Thinking With Tools: ${THINKING_WITH_TOOLS} (env THINKING_WITH_TOOLS)`);
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
