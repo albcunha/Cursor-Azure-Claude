@@ -654,7 +654,7 @@ async function handleChatCompletions(req, res) {
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             const reqHeaders = {
                 "Content-Type": "application/json",
-                "api-key": CONFIG.AZURE_API_KEY,
+                "x-api-key": CONFIG.AZURE_API_KEY,
                 "anthropic-version": CONFIG.ANTHROPIC_VERSION,
             };
             // Build beta flags from Azure-supported list + conditional flags
@@ -828,7 +828,7 @@ app.post("/v1/messages", requireAuth, async (req, res) => {
     try {
         const passthroughHeaders = {
             "Content-Type": "application/json",
-            "api-key": CONFIG.AZURE_API_KEY,
+            "x-api-key": CONFIG.AZURE_API_KEY,
             "anthropic-version": req.headers["anthropic-version"] || CONFIG.ANTHROPIC_VERSION,
         };
         if (req.headers["anthropic-beta"]) {
