@@ -284,7 +284,7 @@ function buildAnthropicRequest(openaiBody) {
     const toolChoiceIsNone = openaiBody.tool_choice === "none";
     const effectiveHasTools = hasTools && !toolChoiceIsNone;
 
-    const thinkingEnabled = thinkingRequested && (!effectiveHasTools || THINKING_WITH_TOOLS === "on");
+    const thinkingEnabled = thinkingRequested;
 
     const maxTokensFromClient = openaiBody.max_tokens || openaiBody.max_completion_tokens;
     const anthropicReq = {
@@ -310,9 +310,6 @@ function buildAnthropicRequest(openaiBody) {
         const toolChoice = convertToolChoiceToAnthropic(openaiBody.tool_choice, openaiBody.parallel_tool_calls);
         anthropicReq.tool_choice = toolChoice || { type: "auto" };
 
-        if (thinkingRequested && !thinkingEnabled) {
-            console.log(`[PROXY] Thinking disabled for this request (tools present, THINKING_WITH_TOOLS=${THINKING_WITH_TOOLS})`);
-        }
     }
 
     return anthropicReq;
@@ -972,7 +969,7 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Model Map: ${JSON.stringify(MODEL_MAP)}`);
     console.log(`Endpoint: ${CONFIG.AZURE_ENDPOINT}`);
     console.log(`Thinking: adaptive (effort=${THINKING_EFFORT}, env THINKING_EFFORT)`);
-    console.log(`Thinking With Tools: ${THINKING_WITH_TOOLS} (env THINKING_WITH_TOOLS)`);
+    console.log(`Thinking With Tools: always on (adaptive thinking is tool-aware)`);
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
