@@ -421,6 +421,7 @@ function writeChunk(res, chunk) {
 }
 
 const LOG_TOOL_CALLS = (process.env.LOG_TOOL_CALLS || "").toLowerCase() === "true";
+const LOG_MESSAGES = (process.env.LOG_MESSAGES || "").toLowerCase() === "true";
 const MAX_STREAM_DURATION_MS = 10 * 60 * 1000; // 10 minutes
 
 // Attempts to close truncated JSON by appending missing quotes/brackets/braces.
@@ -557,8 +558,9 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
                 if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
                     console.log(`[DIAG] tool_use start: id=${event.content_block.id}, name=${event.content_block.name}, index=${event.index}`);
                 }
-                if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
-                    console.log(`[DIAG] input_json_delta index=${event.index}, fragment=${event.delta.partial_json?.substring(0, 80)}`);
+                if (event.type === "content_block_stop" && state.toolCalls.has(event.index)) {
+                    const tc = state.toolCalls.get(event.index);
+                    console.log(`[DIAG] tool_use end: index=${tc.index}, name=${tc.function.name}, args_len=${tc.function.arguments.length}`);
                 }
                 if (event.type === "message_delta" && event.delta?.stop_reason) {
                     console.log(`[DIAG] message_delta stop_reason=${event.delta.stop_reason}`);
@@ -568,9 +570,6 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
             const chunks = translateClaudeEvent(event, state);
             if (chunks) {
                 for (const c of chunks) {
-                    if (LOG_TOOL_CALLS && c.choices?.[0]?.delta?.tool_calls) {
-                        console.log(`[DIAG] outgoing tool chunk: ${JSON.stringify(c.choices[0].delta.tool_calls)}`);
-                    }
                     if (LOG_TOOL_CALLS && c.choices?.[0]?.finish_reason) {
                         console.log(`[DIAG] outgoing finish_reason=${c.choices[0].finish_reason}`);
                     }
@@ -579,7 +578,12 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
             }
 
             if (event.type === "message_stop") {
+                const outputTokens = state.usage?.output_tokens || 0;
+                const inputTokens = state.usage?.input_tokens || 0;
                 console.log(`[STREAM] Done: finish=${state.finishReason}, tools=${state.toolCalls.size}, usage=${JSON.stringify(state.usage || {})}`);
+                if (state.finishReason === "stop" && outputTokens < 50 && state.toolCalls.size === 0) {
+                    console.warn(`[WARN] Suspiciously short response: ${outputTokens} output tokens with end_turn and no tool calls (input_tokens=${inputTokens}). Model may have lost context.`);
+                }
                 streamCompleted = true;
                 try { res.write("data: [DONE]\n\n"); } catch {}
                 cleanup();
@@ -770,6 +774,24 @@ async function handleChatCompletions(req, res) {
         console.log(`[PROXY] cursor_model=${req.body.model} → deployment=${anthropicRequest.model}`);
         console.log(`[PROXY] cursor_max_tokens=${req.body.max_tokens || req.body.max_completion_tokens || 'not set'} → actual_max_tokens=${anthropicRequest.max_tokens}`);
         console.log(`[PROXY] stream=${isStreaming}, tools=${anthropicRequest.tools?.length || 0}, messages=${anthropicRequest.messages.length}, tool_choice=${JSON.stringify(anthropicRequest.tool_choice || 'none')}${anthropicRequest.thinking ? ', thinking=adaptive(effort=' + (anthropicRequest.output_config?.effort || 'high') + ')' : ''}`);
+
+        if (LOG_MESSAGES) {
+            for (let i = 0; i < anthropicRequest.messages.length; i++) {
+                const m = anthropicRequest.messages[i];
+                const contentSummary = Array.isArray(m.content)
+                    ? m.content.map(b => {
+                        if (b.type === "text") return `text(${b.text?.length || 0}ch)`;
+                        if (b.type === "thinking") return `thinking(${b.thinking?.length || 0}ch)`;
+                        if (b.type === "redacted_thinking") return `redacted_thinking`;
+                        if (b.type === "tool_use") return `tool_use(${b.name})`;
+                        if (b.type === "tool_result") return `tool_result(id=${b.tool_use_id?.substring(0, 12)}…)`;
+                        return b.type || "unknown";
+                    }).join(", ")
+                    : typeof m.content === "string" ? `string(${m.content.length}ch)` : String(m.content);
+                console.log(`[MSG] [${i}] role=${m.role}, content=[${contentSummary}]`);
+            }
+        }
+
         console.log(`[PROXY] Calling Azure endpoint...`);
 
         // Retry logic for transient errors (429 rate limit, 529 overloaded)
@@ -1025,6 +1047,8 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
+    console.log(`LOG_TOOL_CALLS: ${LOG_TOOL_CALLS}`);
+    console.log(`LOG_MESSAGES: ${LOG_MESSAGES}`);
     console.log("=".repeat(60));
 });
 
