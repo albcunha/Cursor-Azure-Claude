@@ -131,7 +131,6 @@ function convertMessagesToAnthropic(openaiMessages) {
 
             if (msg.content) {
                 if (typeof msg.content === "string") {
-                    // Issue 2: Filter empty text blocks (factory.py:2465)
                     if (msg.content.length > 0) {
                         contentBlocks.push({ type: "text", text: msg.content });
                     }
@@ -143,14 +142,24 @@ function convertMessagesToAnthropic(openaiMessages) {
                             contentBlocks.push({ type: "thinking", thinking: part.thinking, signature: part.signature || "" });
                         } else if (part.type === "redacted_thinking") {
                             contentBlocks.push({ type: "redacted_thinking", data: part.data || "" });
+                        } else if (part.type === "tool_use" && part.id && part.name) {
+                            if (!seenToolIds.has(part.id)) {
+                                seenToolIds.add(part.id);
+                                contentBlocks.push({
+                                    type: "tool_use",
+                                    id: part.id,
+                                    name: part.name,
+                                    input: part.input || {},
+                                });
+                            }
                         }
                     }
                 }
             }
 
+            // Standard OpenAI tool_calls field
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 for (const tc of msg.tool_calls) {
-                    // Issue 3: Deduplicate tool call IDs (factory.py:2536-2553)
                     if (seenToolIds.has(tc.id)) continue;
                     seenToolIds.add(tc.id);
 
@@ -160,6 +169,22 @@ function convertMessagesToAnthropic(openaiMessages) {
                         type: "tool_use",
                         id: tc.id,
                         name: tc.function.name,
+                        input,
+                    });
+                }
+            }
+
+            // Legacy OpenAI function_call field
+            if (msg.function_call && msg.function_call.name) {
+                const fcId = msg.function_call.id || `fc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                if (!seenToolIds.has(fcId)) {
+                    seenToolIds.add(fcId);
+                    let input = {};
+                    try { input = JSON.parse(msg.function_call.arguments || "{}"); } catch { input = {}; }
+                    contentBlocks.push({
+                        type: "tool_use",
+                        id: fcId,
+                        name: msg.function_call.name,
                         input,
                     });
                 }
@@ -195,6 +220,37 @@ function convertMessagesToAnthropic(openaiMessages) {
             continue;
         }
 
+        // Legacy OpenAI function result format
+        if (msg.role === "function") {
+            let toolUseId = msg.tool_call_id;
+            if (!toolUseId && msg.name) {
+                // Match against the preceding assistant's tool_use blocks by function name
+                const prevAst = anthropicMessages.length > 0 ? anthropicMessages[anthropicMessages.length - 1] : null;
+                if (!prevAst || prevAst.role !== "assistant") {
+                    // Check one level back (there might be a user tool_result message in between)
+                    for (let j = anthropicMessages.length - 1; j >= 0; j--) {
+                        if (anthropicMessages[j].role === "assistant") { const found = anthropicMessages[j]; if (Array.isArray(found.content)) { const match = found.content.find(b => b.type === "tool_use" && b.name === msg.name); if (match) { toolUseId = match.id; } } break; }
+                    }
+                } else if (Array.isArray(prevAst.content)) {
+                    const match = prevAst.content.find(b => b.type === "tool_use" && b.name === msg.name);
+                    if (match) toolUseId = match.id;
+                }
+            }
+            toolUseId = toolUseId || `fc_result_${Date.now()}`;
+            const toolResult = {
+                type: "tool_result",
+                tool_use_id: toolUseId,
+                content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+            };
+            const prev = anthropicMessages[anthropicMessages.length - 1];
+            if (prev && prev.role === "user" && Array.isArray(prev.content) && prev.content[0]?.type === "tool_result") {
+                prev.content.push(toolResult);
+            } else {
+                anthropicMessages.push({ role: "user", content: [toolResult] });
+            }
+            continue;
+        }
+
         if (msg.role === "user") {
             let content;
             if (typeof msg.content === "string") {
@@ -202,6 +258,9 @@ function convertMessagesToAnthropic(openaiMessages) {
             } else if (Array.isArray(msg.content)) {
                 content = msg.content.map((part) => {
                     if (part.type === "text") return { type: "text", text: part.text };
+                    if (part.type === "tool_result" && part.tool_use_id) {
+                        return { type: "tool_result", tool_use_id: part.tool_use_id, content: part.content || "" };
+                    }
                     if (part.type === "image_url") {
                         const url = part.image_url?.url || "";
                         if (url.startsWith("data:")) {
@@ -219,6 +278,34 @@ function convertMessagesToAnthropic(openaiMessages) {
             }
             anthropicMessages.push({ role: "user", content });
             continue;
+        }
+
+        // Catch-all: warn about unhandled roles so they don't silently vanish
+        console.warn(`[CONVERT] Unhandled message role="${msg.role}", converting to user text`)
+        const fallbackText = typeof msg.content === "string" ? msg.content
+            : msg.content ? JSON.stringify(msg.content) : ".";
+        anthropicMessages.push({ role: "user", content: fallbackText || "." });
+    }
+
+    // Deduplicate tool_result blocks by tool_use_id within each user message
+    // (PR #23104: session replay can produce duplicate tool_result for the same tool_use_id)
+    for (const msg of anthropicMessages) {
+        if (msg.role === "user" && Array.isArray(msg.content)) {
+            const seenResultIds = new Map();
+            const toRemove = new Set();
+            for (let i = 0; i < msg.content.length; i++) {
+                const block = msg.content[i];
+                if (block.type === "tool_result" && block.tool_use_id) {
+                    if (seenResultIds.has(block.tool_use_id)) {
+                        toRemove.add(seenResultIds.get(block.tool_use_id));
+                        console.warn(`[CONVERT] Dedup tool_result for ${block.tool_use_id} (keeping last)`);
+                    }
+                    seenResultIds.set(block.tool_use_id, i);
+                }
+            }
+            if (toRemove.size > 0) {
+                msg.content = msg.content.filter((_, i) => !toRemove.has(i));
+            }
         }
     }
 
@@ -241,6 +328,54 @@ function convertMessagesToAnthropic(openaiMessages) {
 
     if (merged.length > 0 && merged[0].role !== "user") {
         merged.unshift({ role: "user", content: "." });
+    }
+
+    // Orphan repair: ensure every tool_use has a tool_result and vice versa
+    // (LiteLLM sanitize_messages_for_tool_calling Cases A-C)
+    const allToolUseIds = new Set();
+    const allToolResultIds = new Set();
+    for (const msg of merged) {
+        if (!Array.isArray(msg.content)) continue;
+        for (const block of msg.content) {
+            if (block.type === "tool_use") allToolUseIds.add(block.id);
+            if (block.type === "tool_result") allToolResultIds.add(block.tool_use_id);
+        }
+    }
+    // Case A: tool_use without tool_result → inject dummy result in the next user message
+    for (const useId of allToolUseIds) {
+        if (!allToolResultIds.has(useId)) {
+            console.warn(`[CONVERT] Orphan tool_use ${useId} — injecting dummy tool_result`);
+            for (let i = 0; i < merged.length; i++) {
+                if (!Array.isArray(merged[i].content)) continue;
+                const hasThisUse = merged[i].content.some(b => b.type === "tool_use" && b.id === useId);
+                if (hasThisUse) {
+                    const nextUser = merged[i + 1];
+                    const dummy = { type: "tool_result", tool_use_id: useId, content: "[No result captured]" };
+                    if (nextUser && nextUser.role === "user") {
+                        const arr = Array.isArray(nextUser.content)
+                            ? nextUser.content : [{ type: "text", text: String(nextUser.content) }];
+                        nextUser.content = [dummy, ...arr];
+                    } else {
+                        merged.splice(i + 1, 0, { role: "user", content: [dummy] });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // Case B: tool_result without tool_use → remove the orphaned result
+    for (const msg of merged) {
+        if (!Array.isArray(msg.content)) continue;
+        msg.content = msg.content.filter(block => {
+            if (block.type === "tool_result" && !allToolUseIds.has(block.tool_use_id)) {
+                console.warn(`[CONVERT] Orphan tool_result ${block.tool_use_id} — removing`);
+                return false;
+            }
+            return true;
+        });
+        if (msg.content.length === 0) {
+            msg.content = [{ type: "text", text: "." }];
+        }
     }
 
     return { system: systemParts.length > 0 ? systemParts.join("\n\n") : undefined, messages: merged };
@@ -766,6 +901,45 @@ async function handleChatCompletions(req, res) {
             clearPreStreamHeartbeat();
             if (isStreaming) return writeSSEError(res, "Invalid request: missing messages", "invalid_request_error");
             return res.status(400).json({ error: { message: "Invalid request: missing messages", type: "invalid_request_error" } });
+        }
+
+        // Compact diagnostic: count tool-related fields in raw messages from Cursor
+        if (LOG_MESSAGES) {
+            const rawMsgs = req.body.messages || [];
+            let nToolCalls = 0, nToolRole = 0, nFunctionRole = 0, nFunctionCall = 0, nContentToolUse = 0, nContentToolResult = 0;
+            for (const m of rawMsgs) {
+                if (m.tool_calls && m.tool_calls.length > 0) nToolCalls++;
+                if (m.role === "tool") nToolRole++;
+                if (m.role === "function") nFunctionRole++;
+                if (m.function_call) nFunctionCall++;
+                if (Array.isArray(m.content)) {
+                    for (const p of m.content) {
+                        if (p.type === "tool_use") nContentToolUse++;
+                        if (p.type === "tool_result") nContentToolResult++;
+                    }
+                }
+            }
+            console.log(`[RAW_SUMMARY] total=${rawMsgs.length}, tool_calls_field=${nToolCalls}, role_tool=${nToolRole}, role_function=${nFunctionRole}, function_call_field=${nFunctionCall}, content_tool_use=${nContentToolUse}, content_tool_result=${nContentToolResult}`);
+
+            // Log details of the LAST 6 messages (most likely to contain the current tool interaction)
+            const startIdx = Math.max(0, rawMsgs.length - 6);
+            for (let i = startIdx; i < rawMsgs.length; i++) {
+                const m = rawMsgs[i];
+                const parts = [`role=${m.role}`];
+                if (m.content === null || m.content === undefined) {
+                    parts.push("content=null");
+                } else if (typeof m.content === "string") {
+                    parts.push(`content=string(${m.content.length}ch)`);
+                } else if (Array.isArray(m.content)) {
+                    const blockTypes = m.content.map(p => p.type || "?").join(",");
+                    parts.push(`content=[${blockTypes}](${m.content.length} blocks)`);
+                }
+                if (m.tool_calls) parts.push(`tool_calls=${JSON.stringify(m.tool_calls.map(tc => ({ id: tc.id?.substring(0, 15), fn: tc.function?.name })))}`);
+                if (m.tool_call_id) parts.push(`tool_call_id=${m.tool_call_id.substring(0, 20)}`);
+                if (m.function_call) parts.push(`function_call=${m.function_call.name}`);
+                if (m.name) parts.push(`name=${m.name}`);
+                console.log(`[RAW_TAIL] [${i}] ${parts.join(", ")}`);
+            }
         }
 
         const anthropicRequest = buildAnthropicRequest(req.body);
