@@ -1,14 +1,33 @@
 // Claude SSE → OpenAI SSE stream translator
 // Based on 9router's claude-to-openai.js (proven reliable with Cursor IDE)
 
+// Matches LiteLLM's model_dump_json(exclude_none=True, exclude_unset=True)
+// so Cursor never sees "content":null or "finish_reason":null in intermediate chunks.
+function stripNulls(obj) {
+    if (obj == null || typeof obj !== "object") return obj;
+    if (Array.isArray(obj)) return obj.map(stripNulls);
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+        if (v !== null && v !== undefined) {
+            out[k] = typeof v === "object" ? stripNulls(v) : v;
+        }
+    }
+    return out;
+}
+
 function createChunk(state, delta, finishReason = null) {
-    return {
+    const chunk = {
         id: `chatcmpl-${state.messageId}`,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model: state.model,
-        choices: [{ index: 0, delta, finish_reason: finishReason }],
+        choices: [{
+            index: 0,
+            delta: stripNulls(delta),
+            ...(finishReason != null ? { finish_reason: finishReason } : {}),
+        }],
     };
+    return chunk;
 }
 
 function convertStopReason(reason) {
@@ -37,6 +56,41 @@ function createStreamState(model) {
         lastChunkHash: null,
         duplicateCount: 0,
     };
+}
+
+// Builds the dedicated final chunk with finish_reason and optional usage.
+// Mirrors LiteLLM's finish_reason_handler() — a single chunk after all
+// content chunks, with delta:{} and the correct finish_reason.
+function buildFinishReasonChunk(state) {
+    let finishReason = state.finishReason || (state.toolCalls.size > 0 ? "tool_calls" : "stop");
+    // Double safety net: if tool calls were emitted but stop_reason was "end_turn",
+    // force "tool_calls" so Cursor triggers tool execution (LiteLLM streaming_handler.py:1748-1751)
+    if (finishReason === "stop" && state.toolCalls.size > 0) {
+        finishReason = "tool_calls";
+    }
+
+    const finalChunk = {
+        id: `chatcmpl-${state.messageId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: state.model,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+    };
+
+    if (state.usage) {
+        const input = state.usage.input_tokens || 0;
+        const output = state.usage.output_tokens || 0;
+        const cached = state.usage.cache_read_input_tokens || 0;
+        const cacheCreation = state.usage.cache_creation_input_tokens || 0;
+        const promptTokens = input + cached + cacheCreation;
+        finalChunk.usage = {
+            prompt_tokens: promptTokens,
+            completion_tokens: output,
+            total_tokens: promptTokens + output,
+        };
+    }
+
+    return finalChunk;
 }
 
 function translateClaudeEvent(event, state) {
@@ -169,68 +223,30 @@ function translateClaudeEvent(event, state) {
                 if (cacheCreation > 0) state.usage.cache_creation_input_tokens = cacheCreation;
             }
 
+            // Store finish_reason but do NOT emit a chunk here.
+            // LiteLLM strips finish_reason from intermediate chunks and only
+            // emits it in a dedicated final chunk (finish_reason_handler pattern).
+            // We defer to message_stop / stream-end for the actual emission.
             if (event.delta?.stop_reason) {
                 const rawStopReason = event.delta.stop_reason;
                 state.finishReason = convertStopReason(rawStopReason);
-                // Override: if we emitted tool calls but stop_reason is "end_turn",
-                // Cursor needs "tool_calls" to trigger tool execution
                 if (state.finishReason === "stop" && state.toolCalls.size > 0) {
                     state.finishReason = "tool_calls";
                 }
 
                 const outputTokens = event.usage?.output_tokens || state.usage?.output_tokens || '?';
-                console.log(`[STREAM] ⚡ stop_reason=${rawStopReason} → finish_reason=${state.finishReason}, output_tokens=${outputTokens}, tool_calls=${state.toolCalls.size}`);
+                console.log(`[STREAM] stop_reason=${rawStopReason} → finish_reason=${state.finishReason}, output_tokens=${outputTokens}, tool_calls=${state.toolCalls.size}`);
                 if (rawStopReason === "max_tokens") {
-                    console.log(`[STREAM] ⚠️  OUTPUT TRUNCATED — model hit max_tokens limit. Increase max_tokens or check resolveMaxTokens().`);
+                    console.log(`[STREAM] OUTPUT TRUNCATED — model hit max_tokens limit.`);
                 }
-
-                const finalChunk = {
-                    id: `chatcmpl-${state.messageId}`,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model: state.model,
-                    choices: [{ index: 0, delta: {}, finish_reason: state.finishReason }],
-                };
-
-                if (state.usage) {
-                    const input = state.usage.input_tokens || 0;
-                    const output = state.usage.output_tokens || 0;
-                    const cached = state.usage.cache_read_input_tokens || 0;
-                    const cacheCreation = state.usage.cache_creation_input_tokens || 0;
-                    const promptTokens = input + cached + cacheCreation;
-                    finalChunk.usage = {
-                        prompt_tokens: promptTokens,
-                        completion_tokens: output,
-                        total_tokens: promptTokens + output,
-                    };
-                }
-
-                results.push(finalChunk);
-                state.finishReasonSent = true;
             }
             break;
         }
 
         case "message_stop": {
+            // Dedicated final chunk — mirrors LiteLLM's finish_reason_handler().
             if (!state.finishReasonSent) {
-                const finishReason = state.finishReason || (state.toolCalls.size > 0 ? "tool_calls" : "stop");
-                const finalChunk = {
-                    id: `chatcmpl-${state.messageId}`,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model: state.model,
-                    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                };
-                if (state.usage) {
-                    const input = state.usage.input_tokens || 0;
-                    const output = state.usage.output_tokens || 0;
-                    finalChunk.usage = {
-                        prompt_tokens: input,
-                        completion_tokens: output,
-                        total_tokens: input + output,
-                    };
-                }
-                results.push(finalChunk);
+                results.push(buildFinishReasonChunk(state));
                 state.finishReasonSent = true;
             }
             break;
@@ -243,4 +259,4 @@ function translateClaudeEvent(event, state) {
     return results.length > 0 ? results : null;
 }
 
-module.exports = { createStreamState, translateClaudeEvent, convertStopReason, createChunk };
+module.exports = { createStreamState, translateClaudeEvent, convertStopReason, createChunk, buildFinishReasonChunk, stripNulls };

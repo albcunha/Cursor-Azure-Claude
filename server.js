@@ -1,6 +1,6 @@
 const express = require("express");
 const axios = require("axios");
-const { createStreamState, translateClaudeEvent, createChunk } = require("./stream-translator");
+const { createStreamState, translateClaudeEvent, createChunk, buildFinishReasonChunk } = require("./stream-translator");
 
 const app = express();
 app.use(express.json({ limit: "250mb" }));
@@ -95,6 +95,7 @@ function requireAuth(req, res, next) {
 function convertMessagesToAnthropic(openaiMessages) {
     let systemParts = [];
     const anthropicMessages = [];
+    const seenToolIds = new Set();
 
     for (const msg of openaiMessages) {
         if (msg.role === "system" || msg.role === "developer") {
@@ -110,18 +111,49 @@ function convertMessagesToAnthropic(openaiMessages) {
         if (msg.role === "assistant") {
             const contentBlocks = [];
 
+            // Issue 1: Thinking blocks must round-trip through conversation history.
+            // Anthropic requires them FIRST in assistant content (factory.py:2443-2447).
+            if (msg.thinking_blocks && Array.isArray(msg.thinking_blocks)) {
+                for (const tb of msg.thinking_blocks) {
+                    if (tb.type === "thinking" && tb.thinking) {
+                        contentBlocks.push({ type: "thinking", thinking: tb.thinking, signature: tb.signature || "" });
+                    } else if (tb.type === "redacted_thinking") {
+                        contentBlocks.push({ type: "redacted_thinking", data: tb.data || "" });
+                    }
+                }
+            }
+            // Also handle reasoning_content (alternative format some clients use)
+            if (msg.reasoning_content && typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+                if (contentBlocks.length === 0 || contentBlocks[0].type !== "thinking") {
+                    contentBlocks.unshift({ type: "thinking", thinking: msg.reasoning_content, signature: msg.reasoning_signature || "" });
+                }
+            }
+
             if (msg.content) {
                 if (typeof msg.content === "string") {
-                    contentBlocks.push({ type: "text", text: msg.content });
+                    // Issue 2: Filter empty text blocks (factory.py:2465)
+                    if (msg.content.length > 0) {
+                        contentBlocks.push({ type: "text", text: msg.content });
+                    }
                 } else if (Array.isArray(msg.content)) {
                     for (const part of msg.content) {
-                        if (part.type === "text") contentBlocks.push({ type: "text", text: part.text });
+                        if (part.type === "text" && part.text && part.text.length > 0) {
+                            contentBlocks.push({ type: "text", text: part.text });
+                        } else if (part.type === "thinking" && part.thinking) {
+                            contentBlocks.push({ type: "thinking", thinking: part.thinking, signature: part.signature || "" });
+                        } else if (part.type === "redacted_thinking") {
+                            contentBlocks.push({ type: "redacted_thinking", data: part.data || "" });
+                        }
                     }
                 }
             }
 
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 for (const tc of msg.tool_calls) {
+                    // Issue 3: Deduplicate tool call IDs (factory.py:2536-2553)
+                    if (seenToolIds.has(tc.id)) continue;
+                    seenToolIds.add(tc.id);
+
                     let input = {};
                     try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
                     contentBlocks.push({
@@ -133,16 +165,24 @@ function convertMessagesToAnthropic(openaiMessages) {
                 }
             }
 
-            if (contentBlocks.length > 0) {
-                anthropicMessages.push({ role: "assistant", content: contentBlocks });
+            // Issue 4: Never skip assistant messages — breaks required role alternation.
+            // If content is empty (e.g. content:null + no tool_calls), push a placeholder.
+            if (contentBlocks.length === 0) {
+                contentBlocks.push({ type: "text", text: "." });
             }
+            anthropicMessages.push({ role: "assistant", content: contentBlocks });
             continue;
         }
 
         if (msg.role === "tool") {
+            // Issue 5: Validate tool_call_id presence
+            const toolUseId = msg.tool_call_id;
+            if (!toolUseId) {
+                console.warn(`[CONVERT] Tool result message missing tool_call_id, generating placeholder`);
+            }
             const toolResult = {
                 type: "tool_result",
-                tool_use_id: msg.tool_call_id,
+                tool_use_id: toolUseId || `toolu_placeholder_${Date.now()}`,
                 content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
             };
 
@@ -380,6 +420,7 @@ function writeChunk(res, chunk) {
     }
 }
 
+const LOG_TOOL_CALLS = (process.env.LOG_TOOL_CALLS || "").toLowerCase() === "true";
 const MAX_STREAM_DURATION_MS = 10 * 60 * 1000; // 10 minutes
 
 // Attempts to close truncated JSON by appending missing quotes/brackets/braces.
@@ -512,16 +553,33 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
                 return;
             }
 
-            const chunks = translateClaudeEvent(event, state);
-            if (chunks) {
-                for (const c of chunks) writeChunk(res, c);
+            if (LOG_TOOL_CALLS) {
+                if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
+                    console.log(`[DIAG] tool_use start: id=${event.content_block.id}, name=${event.content_block.name}, index=${event.index}`);
+                }
+                if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
+                    console.log(`[DIAG] input_json_delta index=${event.index}, fragment=${event.delta.partial_json?.substring(0, 80)}`);
+                }
+                if (event.type === "message_delta" && event.delta?.stop_reason) {
+                    console.log(`[DIAG] message_delta stop_reason=${event.delta.stop_reason}`);
+                }
             }
 
-            if (event.type === "message_delta" && state.finishReasonSent) {
-                console.log(`[STREAM] Done: finish=${state.finishReason}, tools=${state.toolCalls.size}, usage=${JSON.stringify(state.usage || {})}`);
+            const chunks = translateClaudeEvent(event, state);
+            if (chunks) {
+                for (const c of chunks) {
+                    if (LOG_TOOL_CALLS && c.choices?.[0]?.delta?.tool_calls) {
+                        console.log(`[DIAG] outgoing tool chunk: ${JSON.stringify(c.choices[0].delta.tool_calls)}`);
+                    }
+                    if (LOG_TOOL_CALLS && c.choices?.[0]?.finish_reason) {
+                        console.log(`[DIAG] outgoing finish_reason=${c.choices[0].finish_reason}`);
+                    }
+                    writeChunk(res, c);
+                }
             }
 
             if (event.type === "message_stop") {
+                console.log(`[STREAM] Done: finish=${state.finishReason}, tools=${state.toolCalls.size}, usage=${JSON.stringify(state.usage || {})}`);
                 streamCompleted = true;
                 try { res.write("data: [DONE]\n\n"); } catch {}
                 cleanup();
@@ -559,12 +617,11 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
             // Upstream closed without message_stop — known Anthropic streaming bug
             // that truncates tool call arguments mid-transmission
             // (see github.com/anthropics/anthropic-sdk-typescript/issues/842).
-            // Repair truncated tool arguments so Cursor receives valid JSON.
             if (state.toolCalls.size > 0) {
                 for (const [, toolCall] of state.toolCalls) {
                     const repair = repairTruncatedJSON(toolCall.function.arguments);
                     if (repair) {
-                        console.log(`[STREAM] ⚠️  Repairing truncated tool_call[${toolCall.index}] "${toolCall.function.name}" — appending: ${repair}`);
+                        console.log(`[STREAM] Repairing truncated tool_call[${toolCall.index}] "${toolCall.function.name}" — appending: ${repair}`);
                         writeChunk(res, createChunk(state, {
                             tool_calls: [{
                                 index: toolCall.index,
@@ -576,15 +633,10 @@ function handleAnthropicStream(axiosResponse, res, requestModel, abortController
             }
 
             if (!state.finishReasonSent) {
-                const finishReason = state.toolCalls.size > 0 ? "tool_calls" : "stop";
-                writeChunk(res, {
-                    id: `chatcmpl-${state.messageId}`,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model: state.model,
-                    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                });
-                console.log(`[STREAM] Synthesized finish_reason=${finishReason} (upstream ended without message_stop)`);
+                const finalChunk = buildFinishReasonChunk(state);
+                writeChunk(res, finalChunk);
+                state.finishReasonSent = true;
+                console.log(`[STREAM] Synthesized finish_reason=${finalChunk.choices[0].finish_reason} (upstream ended without message_stop)`);
             }
             try { res.write("data: [DONE]\n\n"); } catch {}
         }
