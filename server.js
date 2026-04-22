@@ -13,11 +13,28 @@ const CONFIG = {
     ANTHROPIC_VERSION: "2023-06-01",
 };
 
-// Azure OpenAI config for GPT-family models (gpt-5.4, etc.)
-// The Foundry resource is typically the same as the Anthropic one, but we keep
-// the OpenAI base URL as a separate env var so you can point elsewhere if needed.
+// Derive the Foundry resource base URL from AZURE_ENDPOINT by stripping any
+// path (e.g. /anthropic/v1/messages, /openai/..., trailing slash). Both the
+// Anthropic messages API and the Azure OpenAI chat completions API are served
+// by the same host, so one env var is enough. Override with
+// AZURE_OPENAI_ENDPOINT only if your GPT deployment lives on a different resource.
+function deriveAzureBaseUrl(fullEndpoint) {
+    if (!fullEndpoint) return undefined;
+    try {
+        const u = new URL(fullEndpoint);
+        return `${u.protocol}//${u.host}`;
+    } catch {
+        // Fallback: strip anything after the host if URL parsing fails
+        return fullEndpoint.replace(/^(https?:\/\/[^/]+).*/i, "$1");
+    }
+}
+
+// Azure OpenAI config for GPT-family models (gpt-5.4, etc.). Same resource as
+// AZURE_ENDPOINT by default; AZURE_OPENAI_ENDPOINT is an optional override.
 const GPT_CONFIG = {
-    ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT, // e.g. https://<resource>.services.ai.azure.com
+    ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT
+        ? deriveAzureBaseUrl(process.env.AZURE_OPENAI_ENDPOINT)
+        : deriveAzureBaseUrl(process.env.AZURE_ENDPOINT),
     API_KEY: process.env.AZURE_OPENAI_API_KEY || process.env.AZURE_API_KEY,
     API_VERSION: process.env.AZURE_OPENAI_API_VERSION || "2025-04-01-preview",
     DEPLOYMENT: process.env.AZURE_GPT_DEPLOYMENT || "gpt-5.4",
@@ -26,13 +43,18 @@ const GPT_CONFIG = {
 
 // ─── Model Routing ───────────────────────────────────────────────────────────
 
+// Claude deployment names are configurable via env so users can pin a specific
+// version (e.g. AZURE_CLAUDE_DEPLOYMENT_NAME=claude-opus-4-7). AZURE_CLAUDE_DEPLOYMENT_NAME
+// acts as the overall default; per-family vars override when set.
+const CLAUDE_DEFAULT = process.env.AZURE_CLAUDE_DEPLOYMENT_NAME || "claude-opus-4-6";
+
 const MODEL_MAP = {
-    "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-3-5",
+    "opus":   process.env.AZURE_CLAUDE_OPUS_DEPLOYMENT   || CLAUDE_DEFAULT,
+    "sonnet": process.env.AZURE_CLAUDE_SONNET_DEPLOYMENT || CLAUDE_DEFAULT,
+    "haiku":  process.env.AZURE_CLAUDE_HAIKU_DEPLOYMENT  || CLAUDE_DEFAULT,
 };
 
-const DEFAULT_DEPLOYMENT = "claude-sonnet-4-6";
+const DEFAULT_DEPLOYMENT = CLAUDE_DEFAULT;
 
 // Reasoning-effort suffixes understood for gpt-5.4 (longest first for greedy match).
 const GPT_EFFORT_SUFFIXES = ["minimal", "medium", "high", "low"];
@@ -454,10 +476,11 @@ function shouldEnableThinking(modelName) {
     return lower.includes("thinking") || lower.includes("think");
 }
 
-const MODEL_MAX_OUTPUT = {
-    "claude-opus-4-6": 32000,
-    "claude-sonnet-4-6": 64000,
-    "claude-haiku-3-5": 8192,
+// Family-based limits so custom deployment names (e.g. claude-opus-4-7) still resolve correctly.
+const MODEL_MAX_OUTPUT_BY_FAMILY = {
+    opus: 32000,
+    sonnet: 64000,
+    haiku: 8192,
 };
 // With thinking enabled, 128K is natively supported (no beta header needed)
 const THINKING_MAX_OUTPUT = 128000;
@@ -470,9 +493,18 @@ const MIN_OUTPUT_TOKENS = 16384;
 // Effort level controls how much thinking the model does: "high" (default), "medium", "low".
 const THINKING_EFFORT = (process.env.THINKING_EFFORT || "high").toLowerCase();
 
+function resolveModelMax(deployment) {
+    if (!deployment) return 64000;
+    const lower = deployment.toLowerCase();
+    for (const [family, max] of Object.entries(MODEL_MAX_OUTPUT_BY_FAMILY)) {
+        if (lower.includes(family)) return max;
+    }
+    return 64000;
+}
+
 function resolveMaxTokens(openaiMaxTokens, deployment, thinkingEnabled) {
     if (thinkingEnabled) return THINKING_MAX_OUTPUT;
-    const modelMax = MODEL_MAX_OUTPUT[deployment] || 64000;
+    const modelMax = resolveModelMax(deployment);
     if (!openaiMaxTokens || openaiMaxTokens < MIN_OUTPUT_TOKENS) {
         return Math.min(modelMax, Math.max(MIN_OUTPUT_TOKENS, modelMax));
     }
@@ -1416,15 +1448,16 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log("=".repeat(60));
     console.log(`Cursor Azure Anthropic Proxy`);
     console.log(`Port: ${CONFIG.PORT}`);
-    console.log(`Default Deployment: ${DEFAULT_DEPLOYMENT}`);
-    console.log(`Model Map: ${JSON.stringify(MODEL_MAP)}`);
+    console.log(`Claude Default Deployment: ${DEFAULT_DEPLOYMENT} (AZURE_CLAUDE_DEPLOYMENT_NAME)`);
+    console.log(`Claude Model Map: ${JSON.stringify(MODEL_MAP)}`);
     console.log(`Endpoint: ${CONFIG.AZURE_ENDPOINT}`);
     console.log(`Thinking: adaptive (effort=${THINKING_EFFORT}, env THINKING_EFFORT)`);
     console.log(`Thinking With Tools: always on (adaptive thinking is tool-aware)`);
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
-    console.log(`Azure OpenAI (GPT): ${GPT_CONFIG.ENDPOINT ? `${GPT_CONFIG.ENDPOINT} [deployment=${GPT_CONFIG.DEPLOYMENT}, api-version=${GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]` : "disabled (AZURE_OPENAI_ENDPOINT not set)"}`);
+    const gptEndpointSource = process.env.AZURE_OPENAI_ENDPOINT ? "AZURE_OPENAI_ENDPOINT" : "derived from AZURE_ENDPOINT";
+    console.log(`Azure OpenAI (GPT): ${GPT_CONFIG.ENDPOINT ? `${GPT_CONFIG.ENDPOINT} [${gptEndpointSource}, deployment=${GPT_CONFIG.DEPLOYMENT}, api-version=${GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]` : "disabled (AZURE_ENDPOINT not set)"}`);
     console.log(`LOG_TOOL_CALLS: ${LOG_TOOL_CALLS}`);
     console.log(`LOG_MESSAGES: ${LOG_MESSAGES}`);
     console.log("=".repeat(60));

@@ -56,25 +56,28 @@ curl -X POST https://cursor-azure-claude-proxy-production.up.railway.app/chat/co
 
 ## ⚙️ Environment Variables
 
-Server yêu cầu các biến môi trường sau:
+### Claude (Azure Anthropic)
 
-### Claude (Anthropic on Azure)
+-   `AZURE_ENDPOINT` - Azure Anthropic API endpoint (`https://<resource>.services.ai.azure.com/anthropic/v1/messages`). The GPT base URL is derived from this automatically.
+-   `AZURE_API_KEY` - Azure API key (shared with the OpenAI endpoint on the same Foundry resource)
+-   `AZURE_CLAUDE_DEPLOYMENT_NAME` - Default Claude deployment name, e.g. `claude-opus-4-7`. Used for every Claude request unless a family-specific override is set.
+-   *(optional)* `AZURE_CLAUDE_OPUS_DEPLOYMENT`, `AZURE_CLAUDE_SONNET_DEPLOYMENT`, `AZURE_CLAUDE_HAIKU_DEPLOYMENT` - override the deployment per model family
 
--   `AZURE_ENDPOINT` - Azure Anthropic API endpoint (`.../anthropic/v1/messages`)
--   `AZURE_API_KEY` - Azure API key
--   `SERVICE_API_KEY` - Service API key dùng để xác thực request từ Cursor IDE (phải khớp với API Key trong Cursor Settings)
--   `PORT` - Port để chạy server (mặc định: 3000)
--   `AZURE_DEPLOYMENT_NAME` - Tên deployment trên Azure (mặc định: "claude-opus-4-5")
+### GPT-5.4 (Azure OpenAI)
 
-### GPT-5.4 (Azure OpenAI) — optional
+Leave these unset to disable the GPT route; Claude keeps working.
 
-Leave these unset to disable the GPT route; Claude routing keeps working either way.
-
--   `AZURE_OPENAI_ENDPOINT` - Foundry base URL, e.g. `https://<resource>.services.ai.azure.com` (no path, no trailing slash)
--   `AZURE_OPENAI_API_KEY` - Separate key for the OpenAI endpoint. Defaults to `AZURE_API_KEY` when both are on the same Foundry resource.
 -   `AZURE_OPENAI_API_VERSION` - Default `2025-04-01-preview` (supports gpt-5.4 chat completions + `reasoning_effort`)
 -   `AZURE_GPT_DEPLOYMENT` - Exact name of the gpt-5.4 deployment in your Azure resource. Default `gpt-5.4`
 -   `GPT_REASONING_EFFORT` - Fallback effort (`minimal` / `low` / `medium` / `high`) when Cursor sends the bare `gpt-5.4` id without a suffix. Default `medium`
+-   *(optional)* `AZURE_OPENAI_ENDPOINT` - only if your GPT deployment lives on a different resource than Claude; defaults to the host of `AZURE_ENDPOINT`
+-   *(optional)* `AZURE_OPENAI_API_KEY` - defaults to `AZURE_API_KEY`
+
+### Service
+
+-   `SERVICE_API_KEY` - Key used to authenticate Cursor against this proxy (must match Cursor's **OpenAI API Key** field)
+-   `PORT` - Server port (default 8080; Railway assigns its own)
+-   *(optional)* `LOG_TOOL_CALLS`, `LOG_MESSAGES` - verbose logging toggles (`true`/`false`)
 
 ## 🤖 Using GPT-5.4 in Cursor
 
@@ -131,11 +134,21 @@ npm run dev
    - Vào tab **Variables** trong Railway project
    - Thêm các biến môi trường sau:
      ```
-     AZURE_ENDPOINT=https://<resource>.openai.azure.com/anthropic/v1/messages
+     # Azure Anthropic
+     AZURE_ENDPOINT=https://<resource>.services.ai.azure.com/anthropic/v1/messages
      AZURE_API_KEY=your-azure-api-key
+     AZURE_CLAUDE_DEPLOYMENT_NAME=claude-opus-4-7
+
+     # Azure OpenAI (gpt-5.4)
+     AZURE_OPENAI_API_VERSION=2025-04-01-preview
+     AZURE_GPT_DEPLOYMENT=gpt-5.4
+     GPT_REASONING_EFFORT=high
+
+     # Service
      SERVICE_API_KEY=your-random-secret-key
      PORT=3000
-     AZURE_DEPLOYMENT_NAME=claude-opus-4-5
+     LOG_TOOL_CALLS=false
+     LOG_MESSAGES=false
      ```
    - **Lưu ý**: `SERVICE_API_KEY` để bảo vệ dịch vụ của bạn. Hãy đặt nó thành một chuỗi ký tự ngẫu nhiên.
 
