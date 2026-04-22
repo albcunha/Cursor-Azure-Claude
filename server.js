@@ -259,7 +259,7 @@ function convertMessagesToAnthropic(openaiMessages) {
                 }
             }
 
-            
+
             // Standard OpenAI tool_calls field
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 for (const tc of msg.tool_calls) {
@@ -1067,7 +1067,115 @@ async function handleGptChatCompletions(req, res) {
         }
 
         if (isStreaming) {
-            // Both sides speak OpenAI SSE format — straight pipe is safe.
+            // Azure OpenAI SSE is *almost* OpenAI-compatible, but Azure:
+            //   1) injects a non-standard prologue chunk (empty `choices` +
+            //      `prompt_filter_results`) that some clients reject as malformed;
+            //   2) rewrites `model` to the dated deployment name
+            //      (e.g. `gpt-5.4-2026-03-05`) instead of the id Cursor asked for,
+            //      which strict clients may reject as a model-mismatch;
+            //   3) sprays extra fields (`content_filter_results`, `obfuscation`,
+            //      `service_tier`, `system_fingerprint`, `prompt_filter_results`).
+            // This sanitizer fixes all three line-by-line before forwarding.
+            const originalModelId = cursorModel || GPT_CONFIG.DEPLOYMENT;
+            let sseBuffer = "";
+            let prologueDropped = false;
+            let chunksForwarded = 0;
+            let modelRewrites = 0;
+
+            const handleSseChunk = (chunk) => {
+                sseBuffer += chunk.toString("utf8");
+                // SSE events are separated by a blank line. We split on \n to handle
+                // partial frames; we keep the last (possibly incomplete) line in the buffer.
+                const lines = sseBuffer.split("\n");
+                sseBuffer = lines.pop() ?? "";
+                for (const rawLine of lines) {
+                    const line = rawLine.replace(/\r$/, "");
+
+                    if (line === "") {
+                        // frame separator — just pass through
+                        if (!res.writableEnded) res.write("\n");
+                        continue;
+                    }
+                    if (line.startsWith(":")) {
+                        // SSE comment / heartbeat — pass through
+                        if (!res.writableEnded) res.write(`${line}\n`);
+                        continue;
+                    }
+                    if (!line.startsWith("data:")) {
+                        // unknown SSE field (event:, id:, retry:) — pass through
+                        if (!res.writableEnded) res.write(`${line}\n`);
+                        continue;
+                    }
+
+                    const payload = line.slice(5).trim();
+                    if (payload === "[DONE]") {
+                        if (!res.writableEnded) res.write(`data: [DONE]\n`);
+                        continue;
+                    }
+
+                    let obj;
+                    try {
+                        obj = JSON.parse(payload);
+                    } catch {
+                        // Unparseable — forward verbatim to avoid losing data
+                        if (!res.writableEnded) res.write(`${line}\n`);
+                        continue;
+                    }
+
+                    // 1) Drop Azure's prologue: empty choices + filter metadata only.
+                    const isPrologue =
+                        Array.isArray(obj.choices) &&
+                        obj.choices.length === 0 &&
+                        (obj.prompt_filter_results !== undefined || obj.id === "" || obj.model === "");
+                    if (isPrologue) {
+                        prologueDropped = true;
+                        continue;
+                    }
+
+                    // 2) Strip Azure-only noise fields from the chunk.
+                    delete obj.prompt_filter_results;
+                    delete obj.obfuscation;
+                    delete obj.system_fingerprint;
+                    delete obj.service_tier;
+                    if (Array.isArray(obj.choices)) {
+                        for (const choice of obj.choices) {
+                            if (choice && typeof choice === "object") {
+                                delete choice.content_filter_results;
+                                delete choice.content_filter_offsets;
+                                if (choice.delta && typeof choice.delta === "object") {
+                                    // `refusal: null` is harmless but not standard; strip to be safe.
+                                    if (choice.delta.refusal === null) delete choice.delta.refusal;
+                                }
+                            }
+                        }
+                    }
+
+                    // 3) Rewrite `model` back to the id Cursor originally requested.
+                    // Azure returns the dated variant (e.g. gpt-5.4-2026-03-05) which
+                    // strict OpenAI clients may reject as a mismatch against the
+                    // model they asked for.
+                    if (typeof obj.model === "string" && obj.model !== originalModelId) {
+                        obj.model = originalModelId;
+                        modelRewrites += 1;
+                    }
+
+                    chunksForwarded += 1;
+                    if (!res.writableEnded) {
+                        res.write(`data: ${JSON.stringify(obj)}\n`);
+                    }
+                }
+            };
+
+            response.data.on("data", handleSseChunk);
+            response.data.on("end", () => {
+                // Flush any leftover partial line (rare, should be empty).
+                if (sseBuffer.trim().length > 0 && !res.writableEnded) {
+                    res.write(sseBuffer);
+                    sseBuffer = "";
+                }
+                if (!res.writableEnded) res.end();
+                console.log(`[GPT STREAM] Done: prologue_dropped=${prologueDropped}, chunks_forwarded=${chunksForwarded}, model_rewrites=${modelRewrites}`);
+            });
             response.data.on("error", (err) => {
                 console.error("[GPT STREAM] Error:", err.message);
                 if (!res.writableEnded) {
@@ -1079,9 +1187,29 @@ async function handleGptChatCompletions(req, res) {
                     try { response.data.destroy(); } catch {}
                 }
             });
-            response.data.pipe(res);
         } else {
-            res.json(response.data);
+            const originalModelId = cursorModel || GPT_CONFIG.DEPLOYMENT;
+            const sanitized = { ...response.data };
+            delete sanitized.prompt_filter_results;
+            delete sanitized.system_fingerprint;
+            delete sanitized.service_tier;
+            if (typeof sanitized.model === "string" && sanitized.model !== originalModelId) {
+                sanitized.model = originalModelId;
+            }
+            if (Array.isArray(sanitized.choices)) {
+                sanitized.choices = sanitized.choices.map((c) => {
+                    if (!c || typeof c !== "object") return c;
+                    const copy = { ...c };
+                    delete copy.content_filter_results;
+                    delete copy.content_filter_offsets;
+                    if (copy.message && typeof copy.message === "object" && copy.message.refusal === null) {
+                        copy.message = { ...copy.message };
+                        delete copy.message.refusal;
+                    }
+                    return copy;
+                });
+            }
+            res.json(sanitized);
         }
     } catch (error) {
         clearPreStreamHeartbeat();
