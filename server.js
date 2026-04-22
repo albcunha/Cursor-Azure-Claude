@@ -1059,19 +1059,32 @@ function convertToolsToResponses(openaiTools) {
 
 function buildResponsesBody(openaiBody, effort) {
     const { instructions, input } = convertMessagesToResponsesInput(openaiBody.messages || []);
+
+    // Azure rejects `input: null` with "expected a string, but got an object".
+    // If we have no user/assistant/tool turns, fall back to a minimal stub so
+    // the request is still well-formed. The instructions field still carries
+    // any system/developer content.
+    const safeInput = (Array.isArray(input) && input.length > 0)
+        ? input
+        : [{ role: "user", content: [{ type: "input_text", text: "" }] }];
+
     const body = {
-        instructions,
-        input,
         model: GPT_CONFIG.DEPLOYMENT,
+        input: safeInput,
         tools: convertToolsToResponses(openaiBody.tools || []),
         tool_choice: openaiBody.tool_choice || "auto",
-        prompt_cache_key: openaiBody.user,
         // Always stream upstream — we buffer on our side when the client asked for non-streaming.
         stream: true,
         reasoning: { effort },
         store: false,
         stream_options: { include_obfuscation: false },
     };
+    // Only include optional fields when they have a real value. Azure's validator
+    // sometimes rejects nulls on fields that are documented as optional strings.
+    if (instructions) body.instructions = instructions;
+    if (typeof openaiBody.user === "string" && openaiBody.user.length > 0) {
+        body.prompt_cache_key = openaiBody.user;
+    }
     if (["auto", "detailed", "concise"].includes(GPT_CONFIG.SUMMARY_LEVEL)) {
         body.reasoning.summary = GPT_CONFIG.SUMMARY_LEVEL;
     }
@@ -1236,7 +1249,21 @@ async function handleGptResponsesApi(req, res) {
     try {
         const body = buildResponsesBody(req.body, effort);
         const url = buildGptResponsesUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.API_VERSION);
-        console.log(`[GPT-RESP] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${effort}, client_stream=${clientWantsStream}, tools=${body.tools?.length || 0}, input_items=${body.input?.length || 0}, summary=${body.reasoning.summary || "off"}, verbosity=${body.text?.verbosity || "default"}`);
+
+        // Raw-body summary so we can see what Cursor sent (roles, content shapes)
+        // without dumping sensitive prompt text. Activated whenever LOG_MESSAGES=true
+        // OR when the request arrived with no convertible input.
+        const rawMsgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
+        const inputSummary = body.input.map(it => it.type || it.role || "?").join(",");
+        if (LOG_MESSAGES || body.input.length === 0 || rawMsgs.length === 0) {
+            const roleCounts = rawMsgs.reduce((acc, m) => {
+                const k = m && m.role ? m.role : "missing";
+                acc[k] = (acc[k] || 0) + 1;
+                return acc;
+            }, {});
+            console.log(`[GPT-RESP RAW] messages=${rawMsgs.length}, roles=${JSON.stringify(roleCounts)}, has_tools=${Array.isArray(req.body?.tools) && req.body.tools.length > 0}, has_tool_choice=${!!req.body?.tool_choice}, has_instructions=${!!body.instructions}`);
+        }
+        console.log(`[GPT-RESP] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${effort}, client_stream=${clientWantsStream}, tools=${body.tools?.length || 0}, input_items=${body.input.length} [${inputSummary}], summary=${body.reasoning.summary || "off"}, verbosity=${body.text?.verbosity || "default"}`);
 
         const response = await axios.post(url, body, {
             headers: {
@@ -1255,6 +1282,17 @@ async function handleGptResponsesApi(req, res) {
         if (response.status >= 400) {
             const errorBody = await extractErrorFromResponse(response, true);
             console.error(`[GPT-RESP ERROR] Azure ${response.status}:`, errorBody);
+            console.error(`[GPT-RESP ERROR] Request body we sent:`, JSON.stringify({
+                model: body.model,
+                has_input: Array.isArray(body.input) && body.input.length > 0,
+                input_shape: inputSummary,
+                has_instructions: !!body.instructions,
+                tools_count: body.tools?.length || 0,
+                reasoning: body.reasoning,
+                has_text: !!body.text,
+                truncation: body.truncation,
+                stream: body.stream,
+            }));
             if (clientWantsStream) return writeSSEError(res, errorBody.error?.message || errorBody.message || "Azure Responses API error");
             return res.status(response.status).json({
                 error: {
