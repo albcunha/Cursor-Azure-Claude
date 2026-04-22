@@ -58,19 +58,23 @@ curl -X POST https://cursor-azure-claude-proxy-production.up.railway.app/chat/co
 
 ### Claude (Azure Anthropic)
 
--   `AZURE_ENDPOINT` - Azure Anthropic API endpoint (`https://<resource>.services.ai.azure.com/anthropic/v1/messages`). The GPT base URL is derived from this automatically.
+-   `AZURE_ENDPOINT` - Foundry resource base URL, e.g. `https://<resource>.services.ai.azure.com` (bare host, no path). The server appends `/anthropic/v1/messages` for Claude and reuses the same host for the Azure OpenAI calls. The legacy full-URL form (`.../anthropic/v1/messages`) is still accepted for backward compatibility.
 -   `AZURE_API_KEY` - Azure API key (shared with the OpenAI endpoint on the same Foundry resource)
 -   `AZURE_CLAUDE_DEPLOYMENT_NAME` - Default Claude deployment name, e.g. `claude-opus-4-7`. Used for every Claude request unless a family-specific override is set.
 -   *(optional)* `AZURE_CLAUDE_OPUS_DEPLOYMENT`, `AZURE_CLAUDE_SONNET_DEPLOYMENT`, `AZURE_CLAUDE_HAIKU_DEPLOYMENT` - override the deployment per model family
 
 ### GPT-5.4 (Azure OpenAI)
 
-Leave these unset to disable the GPT route; Claude keeps working.
+Azure OpenAI uses a **different host** than Anthropic (`cognitiveservices.azure.com` instead of `services.ai.azure.com`), so `AZURE_OPENAI_ENDPOINT` is required for GPT. Leave it unset to disable the GPT route — Claude keeps working either way.
 
--   `AZURE_OPENAI_API_VERSION` - Default `2025-04-01-preview` (supports gpt-5.4 chat completions + `reasoning_effort`)
+-   `AZURE_OPENAI_ENDPOINT` - Azure OpenAI endpoint. Two forms are supported:
+    - **v1 API** (recommended): `https://<resource>.cognitiveservices.azure.com/openai/v1`
+      - Request URL becomes `<endpoint>/chat/completions?api-version=preview` — the api-version is fixed and `AZURE_OPENAI_API_VERSION` is ignored.
+    - **Legacy deployment URL**: `https://<resource>.cognitiveservices.azure.com`
+      - Request URL becomes `<host>/openai/deployments/<deployment>/chat/completions?api-version=<AZURE_OPENAI_API_VERSION>`.
 -   `AZURE_GPT_DEPLOYMENT` - Exact name of the gpt-5.4 deployment in your Azure resource. Default `gpt-5.4`
+-   `AZURE_OPENAI_API_VERSION` - Only used with the legacy endpoint form. Default `2025-04-01-preview`.
 -   `GPT_REASONING_EFFORT` - Fallback effort (`minimal` / `low` / `medium` / `high`) when Cursor sends the bare `gpt-5.4` id without a suffix. Default `medium`
--   *(optional)* `AZURE_OPENAI_ENDPOINT` - only if your GPT deployment lives on a different resource than Claude; defaults to the host of `AZURE_ENDPOINT`
 -   *(optional)* `AZURE_OPENAI_API_KEY` - defaults to `AZURE_API_KEY`
 
 ### Service
@@ -135,14 +139,18 @@ npm run dev
    - Thêm các biến môi trường sau:
      ```
      # Azure Anthropic
-     AZURE_ENDPOINT=https://<resource>.services.ai.azure.com/anthropic/v1/messages
+     AZURE_ENDPOINT=https://<resource>.services.ai.azure.com
      AZURE_API_KEY=your-azure-api-key
      AZURE_CLAUDE_DEPLOYMENT_NAME=claude-opus-4-7
+     AZURE_CLAUDE_SONNET_DEPLOYMENT=claude-sonnet-4-6
+     AZURE_CLAUDE_HAIKU_DEPLOYMENT=claude-haiku-4-6
 
-     # Azure OpenAI (gpt-5.4)
-     AZURE_OPENAI_API_VERSION=2025-04-01-preview
+     # Azure OpenAI (gpt-5.4) — note different host from AZURE_ENDPOINT
+     AZURE_OPENAI_ENDPOINT=https://<resource>.cognitiveservices.azure.com/openai/v1
      AZURE_GPT_DEPLOYMENT=gpt-5.4
      GPT_REASONING_EFFORT=high
+     # Only needed with the legacy (non-/openai/v1) endpoint form:
+     # AZURE_OPENAI_API_VERSION=2025-04-01-preview
 
      # Service
      SERVICE_API_KEY=your-random-secret-key

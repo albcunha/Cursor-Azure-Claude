@@ -5,41 +5,83 @@ const { createStreamState, translateClaudeEvent, createChunk, buildFinishReasonC
 const app = express();
 app.use(express.json({ limit: "250mb" }));
 
+// AZURE_ENDPOINT is the bare Foundry host for Anthropic models, e.g.
+//   https://<resource>.services.ai.azure.com
+// The server appends /anthropic/v1/messages automatically. The legacy full-URL
+// form ending in /anthropic/v1/messages is still accepted for backward compat.
+const ANTHROPIC_MESSAGES_PATH = "/anthropic/v1/messages";
+
+function stripTrailingSlashes(s) {
+    return s ? s.replace(/\/+$/, "") : s;
+}
+
+function deriveAnthropicUrl(fullEndpoint) {
+    if (!fullEndpoint) return undefined;
+    const trimmed = stripTrailingSlashes(fullEndpoint);
+    if (/\/anthropic\/v\d+\/messages$/i.test(trimmed)) return trimmed;
+    try {
+        const u = new URL(trimmed);
+        return `${u.protocol}//${u.host}${ANTHROPIC_MESSAGES_PATH}`;
+    } catch {
+        return `${trimmed.replace(/^(https?:\/\/[^/]+).*/i, "$1")}${ANTHROPIC_MESSAGES_PATH}`;
+    }
+}
+
 const CONFIG = {
-    AZURE_ENDPOINT: process.env.AZURE_ENDPOINT,
+    AZURE_ENDPOINT: deriveAnthropicUrl(process.env.AZURE_ENDPOINT),
     AZURE_API_KEY: process.env.AZURE_API_KEY,
     SERVICE_API_KEY: process.env.SERVICE_API_KEY,
     PORT: process.env.PORT || 8080,
     ANTHROPIC_VERSION: "2023-06-01",
 };
 
-// Derive the Foundry resource base URL from AZURE_ENDPOINT by stripping any
-// path (e.g. /anthropic/v1/messages, /openai/..., trailing slash). Both the
-// Anthropic messages API and the Azure OpenAI chat completions API are served
-// by the same host, so one env var is enough. Override with
-// AZURE_OPENAI_ENDPOINT only if your GPT deployment lives on a different resource.
-function deriveAzureBaseUrl(fullEndpoint) {
-    if (!fullEndpoint) return undefined;
+// Azure OpenAI lives on a DIFFERENT host than Anthropic in Foundry:
+//   Anthropic: <resource>.services.ai.azure.com
+//   OpenAI:    <resource>.cognitiveservices.azure.com
+// So AZURE_OPENAI_ENDPOINT is a distinct env var with no auto-derivation.
+//
+// Two URL styles are supported:
+//  1) v1 (recommended): endpoint ends with `/openai/v1` (or `/openai/v1/`).
+//     Request URL → `<endpoint>/chat/completions?api-version=preview`
+//     Example:    https://<res>.cognitiveservices.azure.com/openai/v1
+//  2) Legacy: bare host or any other path.
+//     Request URL → `<host>/openai/deployments/<deployment>/chat/completions?api-version=<AZURE_OPENAI_API_VERSION>`
+//     Example:    https://<res>.cognitiveservices.azure.com
+function resolveGptUrlShape(endpoint) {
+    if (!endpoint) return null;
+    const base = stripTrailingSlashes(endpoint);
+    if (/\/openai\/v1$/i.test(base)) return { style: "v1", base };
+    // Tolerate a trailing "/openai" on the host
+    const host = base.replace(/\/openai$/i, "");
     try {
-        const u = new URL(fullEndpoint);
-        return `${u.protocol}//${u.host}`;
+        const u = new URL(host);
+        return { style: "deployment", base: `${u.protocol}//${u.host}` };
     } catch {
-        // Fallback: strip anything after the host if URL parsing fails
-        return fullEndpoint.replace(/^(https?:\/\/[^/]+).*/i, "$1");
+        return { style: "deployment", base: host.replace(/^(https?:\/\/[^/]+).*/i, "$1") };
     }
 }
 
-// Azure OpenAI config for GPT-family models (gpt-5.4, etc.). Same resource as
-// AZURE_ENDPOINT by default; AZURE_OPENAI_ENDPOINT is an optional override.
-const GPT_CONFIG = {
-    ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT
-        ? deriveAzureBaseUrl(process.env.AZURE_OPENAI_ENDPOINT)
-        : deriveAzureBaseUrl(process.env.AZURE_ENDPOINT),
-    API_KEY: process.env.AZURE_OPENAI_API_KEY || process.env.AZURE_API_KEY,
-    API_VERSION: process.env.AZURE_OPENAI_API_VERSION || "2025-04-01-preview",
-    DEPLOYMENT: process.env.AZURE_GPT_DEPLOYMENT || "gpt-5.4",
-    DEFAULT_EFFORT: (process.env.GPT_REASONING_EFFORT || "medium").toLowerCase(),
-};
+function buildGptUrl(shape, deployment, apiVersion) {
+    if (shape.style === "v1") {
+        return `${shape.base}/chat/completions?api-version=preview`;
+    }
+    return `${shape.base}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
+const GPT_CONFIG = (() => {
+    const raw = process.env.AZURE_OPENAI_ENDPOINT;
+    const shape = resolveGptUrlShape(raw);
+    return {
+        RAW_ENDPOINT: raw,
+        SHAPE: shape,
+        API_KEY: process.env.AZURE_OPENAI_API_KEY || process.env.AZURE_API_KEY,
+        API_VERSION: process.env.AZURE_OPENAI_API_VERSION || "2025-04-01-preview",
+        DEPLOYMENT: process.env.AZURE_GPT_DEPLOYMENT || "gpt-5.4",
+        DEFAULT_EFFORT: (process.env.GPT_REASONING_EFFORT || "medium").toLowerCase(),
+        // Kept for startup-log back-compat
+        ENDPOINT: shape ? shape.base : undefined,
+    };
+})();
 
 // ─── Model Routing ───────────────────────────────────────────────────────────
 
@@ -916,7 +958,7 @@ function writeSSEError(res, message, type = "proxy_error") {
 async function handleGptChatCompletions(req, res) {
     const requestStart = Date.now();
 
-    if (!GPT_CONFIG.ENDPOINT) {
+    if (!GPT_CONFIG.SHAPE) {
         return res.status(500).json({
             error: { message: "AZURE_OPENAI_ENDPOINT not configured", type: "configuration_error" },
         });
@@ -989,10 +1031,9 @@ async function handleGptChatCompletions(req, res) {
             upstreamBody.reasoning_effort = effort;
         }
 
-        const base = GPT_CONFIG.ENDPOINT.replace(/\/+$/, "");
-        const url = `${base}/openai/deployments/${encodeURIComponent(GPT_CONFIG.DEPLOYMENT)}/chat/completions?api-version=${encodeURIComponent(GPT_CONFIG.API_VERSION)}`;
+        const url = buildGptUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.DEPLOYMENT, GPT_CONFIG.API_VERSION);
 
-        console.log(`[GPT] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${upstreamBody.reasoning_effort}, stream=${isStreaming}, tools=${upstreamBody.tools?.length || 0}, messages=${upstreamBody.messages?.length || 0}`);
+        console.log(`[GPT] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${upstreamBody.reasoning_effort}, stream=${isStreaming}, tools=${upstreamBody.tools?.length || 0}, messages=${upstreamBody.messages?.length || 0}, api_style=${GPT_CONFIG.SHAPE.style}`);
 
         const response = await axios.post(url, upstreamBody, {
             headers: {
@@ -1339,7 +1380,7 @@ function getModelList() {
     }
     // Advertise the gpt-5.4 reasoning-effort variants when an Azure OpenAI
     // endpoint is configured. The base id can still be used without a suffix.
-    if (GPT_CONFIG.ENDPOINT) {
+    if (GPT_CONFIG.SHAPE) {
         for (const id of Object.keys(GPT_MODEL_MAP)) {
             if (!seen.has(id)) {
                 seen.add(id);
@@ -1459,19 +1500,22 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Port: ${CONFIG.PORT}`);
     console.log(`Claude Default Deployment: ${DEFAULT_DEPLOYMENT} (AZURE_CLAUDE_DEPLOYMENT_NAME)`);
     console.log(`Claude Model Map: ${JSON.stringify(MODEL_MAP)}`);
-    console.log(`Endpoint: ${CONFIG.AZURE_ENDPOINT}`);
+    const endpointSource = process.env.AZURE_ENDPOINT === CONFIG.AZURE_ENDPOINT
+        ? "AZURE_ENDPOINT"
+        : `derived from AZURE_ENDPOINT (${process.env.AZURE_ENDPOINT || "unset"})`;
+    console.log(`Claude Endpoint: ${CONFIG.AZURE_ENDPOINT} [${endpointSource}]`);
     console.log(`Thinking: adaptive (effort=${THINKING_EFFORT}, env THINKING_EFFORT)`);
     console.log(`Thinking With Tools: always on (adaptive thinking is tool-aware)`);
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
-    if (GPT_CONFIG.ENDPOINT) {
-        const gptEndpointSource = process.env.AZURE_OPENAI_ENDPOINT ? "AZURE_OPENAI_ENDPOINT" : "derived from AZURE_ENDPOINT";
+    if (GPT_CONFIG.SHAPE) {
+        const resolvedUrl = buildGptUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.DEPLOYMENT, GPT_CONFIG.API_VERSION);
         console.log(`GPT Default Deployment: ${GPT_CONFIG.DEPLOYMENT} (AZURE_GPT_DEPLOYMENT)`);
         console.log(`GPT Model Map (cursor_id → reasoning_effort): ${JSON.stringify(GPT_MODEL_MAP)}`);
-        console.log(`GPT Endpoint: ${GPT_CONFIG.ENDPOINT} [${gptEndpointSource}, api-version=${GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]`);
+        console.log(`GPT Endpoint: ${resolvedUrl} [style=${GPT_CONFIG.SHAPE.style}, api-version=${GPT_CONFIG.SHAPE.style === "v1" ? "preview" : GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]`);
     } else {
-        console.log(`Azure OpenAI (GPT): disabled (AZURE_ENDPOINT not set)`);
+        console.log(`Azure OpenAI (GPT): disabled (AZURE_OPENAI_ENDPOINT not set)`);
     }
     console.log(`LOG_TOOL_CALLS: ${LOG_TOOL_CALLS}`);
     console.log(`LOG_MESSAGES: ${LOG_MESSAGES}`);
