@@ -59,6 +59,16 @@ const DEFAULT_DEPLOYMENT = CLAUDE_DEFAULT;
 // Reasoning-effort suffixes understood for gpt-5.4 (longest first for greedy match).
 const GPT_EFFORT_SUFFIXES = ["minimal", "medium", "high", "low"];
 
+// Cursor-facing gpt-5.4 model ids and the reasoning_effort each resolves to.
+// The bare `gpt-5.4` id falls back to GPT_CONFIG.DEFAULT_EFFORT (env-controlled).
+const GPT_MODEL_MAP = {
+    "gpt-5.4":          GPT_CONFIG.DEFAULT_EFFORT,
+    "gpt-5.4-minimal":  "minimal",
+    "gpt-5.4-low":      "low",
+    "gpt-5.4-medium":   "medium",
+    "gpt-5.4-high":     "high",
+};
+
 function isGptModel(cursorModel) {
     if (!cursorModel) return false;
     return cursorModel.toLowerCase().startsWith("gpt-");
@@ -1330,8 +1340,7 @@ function getModelList() {
     // Advertise the gpt-5.4 reasoning-effort variants when an Azure OpenAI
     // endpoint is configured. The base id can still be used without a suffix.
     if (GPT_CONFIG.ENDPOINT) {
-        const gptIds = ["gpt-5.4", "gpt-5.4-minimal", "gpt-5.4-low", "gpt-5.4-medium", "gpt-5.4-high"];
-        for (const id of gptIds) {
+        for (const id of Object.keys(GPT_MODEL_MAP)) {
             if (!seen.has(id)) {
                 seen.add(id);
                 models.push({ id, object: "model", created: 1700000000, owned_by: "azure-openai" });
@@ -1456,8 +1465,14 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
-    const gptEndpointSource = process.env.AZURE_OPENAI_ENDPOINT ? "AZURE_OPENAI_ENDPOINT" : "derived from AZURE_ENDPOINT";
-    console.log(`Azure OpenAI (GPT): ${GPT_CONFIG.ENDPOINT ? `${GPT_CONFIG.ENDPOINT} [${gptEndpointSource}, deployment=${GPT_CONFIG.DEPLOYMENT}, api-version=${GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]` : "disabled (AZURE_ENDPOINT not set)"}`);
+    if (GPT_CONFIG.ENDPOINT) {
+        const gptEndpointSource = process.env.AZURE_OPENAI_ENDPOINT ? "AZURE_OPENAI_ENDPOINT" : "derived from AZURE_ENDPOINT";
+        console.log(`GPT Default Deployment: ${GPT_CONFIG.DEPLOYMENT} (AZURE_GPT_DEPLOYMENT)`);
+        console.log(`GPT Model Map (cursor_id → reasoning_effort): ${JSON.stringify(GPT_MODEL_MAP)}`);
+        console.log(`GPT Endpoint: ${GPT_CONFIG.ENDPOINT} [${gptEndpointSource}, api-version=${GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]`);
+    } else {
+        console.log(`Azure OpenAI (GPT): disabled (AZURE_ENDPOINT not set)`);
+    }
     console.log(`LOG_TOOL_CALLS: ${LOG_TOOL_CALLS}`);
     console.log(`LOG_MESSAGES: ${LOG_MESSAGES}`);
     console.log("=".repeat(60));
