@@ -68,9 +68,19 @@ function buildGptUrl(shape, deployment, apiVersion) {
     return `${shape.base}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
 }
 
+// Responses API lives at `<host>/openai/responses?api-version=...`. GPT‑5.x
+// reasoning models (including gpt-5.4, gpt-5-pro, gpt-5-codex) are native to
+// this API; chat/completions is a best-effort legacy shim that drops
+// reasoning/summary/tool-call events. Use this shape when API_MODE=responses.
+function buildGptResponsesUrl(shape, apiVersion) {
+    if (!shape) return null;
+    return `${shape.base.replace(/\/openai\/v1$/i, "").replace(/\/openai$/i, "")}/openai/responses?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
 const GPT_CONFIG = (() => {
     const raw = process.env.AZURE_OPENAI_ENDPOINT;
     const shape = resolveGptUrlShape(raw);
+    const mode = (process.env.AZURE_GPT_API_MODE || "chat").toLowerCase();
     return {
         RAW_ENDPOINT: raw,
         SHAPE: shape,
@@ -78,6 +88,15 @@ const GPT_CONFIG = (() => {
         API_VERSION: process.env.AZURE_OPENAI_API_VERSION || "2025-04-01-preview",
         DEPLOYMENT: process.env.AZURE_GPT_DEPLOYMENT || "gpt-5.4",
         DEFAULT_EFFORT: (process.env.GPT_REASONING_EFFORT || "medium").toLowerCase(),
+        // "chat" = /openai/v1/chat/completions (legacy). "responses" = /openai/responses
+        // (required for gpt-5.4 / gpt-5-pro / gpt-5-codex — see Cursor-Azure-GPT-5).
+        API_MODE: mode === "responses" ? "responses" : "chat",
+        SUMMARY_LEVEL: (process.env.AZURE_GPT_SUMMARY_LEVEL || "detailed").toLowerCase(),
+        VERBOSITY_LEVEL: (process.env.AZURE_GPT_VERBOSITY_LEVEL || "medium").toLowerCase(),
+        TRUNCATION: (process.env.AZURE_GPT_TRUNCATION || "disabled").toLowerCase(),
+        // Cursor renders content inside <think>...</think> as reasoning. Turn off
+        // if a client renders literal tags (some strict chat UIs).
+        EMIT_THINK_TAGS: (process.env.AZURE_GPT_EMIT_THINK_TAGS || "true").toLowerCase() !== "false",
         // Kept for startup-log back-compat
         ENDPOINT: shape ? shape.base : undefined,
     };
@@ -948,6 +967,429 @@ function writeSSEError(res, message, type = "proxy_error") {
     } catch {}
 }
 
+// ─── Azure OpenAI (GPT-5.x) Responses API adapter ────────────────────────────
+//
+// GPT‑5.x reasoning models (gpt-5.4, gpt-5-pro, gpt-5-codex, …) are native to
+// Azure's Responses API (`/openai/responses`). Chat Completions on the v1
+// preview endpoint often returns 200 but drops reasoning/tool events in a way
+// Cursor renders as "Invalid API key". When AZURE_GPT_API_MODE=responses we
+// translate Cursor's chat-completions request into Responses schema, stream
+// from `/openai/responses`, and convert events back into chat.completion.chunk
+// frames Cursor understands.
+//
+// This is a faithful port of the transform in Cursor-Azure-GPT-5
+// (request_adapter.py / response_adapter.py).
+
+function contentToText(content) {
+    if (content == null) return "";
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return String(content);
+    const parts = [];
+    for (const part of content) {
+        if (part && typeof part === "object") {
+            if (part.type === "text") parts.push(part.text || "");
+            else if (part.type === "image_url") parts.push("[image]");
+            else parts.push(`[${part.type || "unknown"}]`);
+        } else {
+            parts.push(String(part));
+        }
+    }
+    return parts.join("\n");
+}
+
+function convertMessagesToResponsesInput(messages) {
+    const instructionsParts = [];
+    const input = [];
+    for (const m of messages || []) {
+        const role = m.role;
+        if (role === "system" || role === "developer") {
+            const t = contentToText(m.content);
+            if (t) instructionsParts.push(t);
+            continue;
+        }
+        if (role === "tool") {
+            input.push({
+                type: "function_call_output",
+                output: contentToText(m.content),
+                status: "completed",
+                call_id: m.tool_call_id,
+            });
+            continue;
+        }
+        // user / assistant / anything else → text turn
+        const text = contentToText(m.content);
+        input.push({
+            role: role || "user",
+            content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+        });
+        if (Array.isArray(m.tool_calls)) {
+            for (const tc of m.tool_calls) {
+                const fn = tc.function || {};
+                input.push({
+                    type: "function_call",
+                    name: fn.name,
+                    arguments: fn.arguments,
+                    call_id: tc.id,
+                });
+            }
+        }
+    }
+    return {
+        instructions: instructionsParts.length ? instructionsParts.join("\n\n") : null,
+        input: input.length ? input : null,
+    };
+}
+
+function convertToolsToResponses(openaiTools) {
+    if (!Array.isArray(openaiTools)) return [];
+    const out = [];
+    for (const tool of openaiTools) {
+        const fn = tool && tool.function;
+        if (!fn) continue;
+        out.push({
+            type: "function",
+            name: fn.name,
+            description: fn.description,
+            parameters: fn.parameters,
+            strict: false,
+        });
+    }
+    return out;
+}
+
+function buildResponsesBody(openaiBody, effort) {
+    const { instructions, input } = convertMessagesToResponsesInput(openaiBody.messages || []);
+    const body = {
+        instructions,
+        input,
+        model: GPT_CONFIG.DEPLOYMENT,
+        tools: convertToolsToResponses(openaiBody.tools || []),
+        tool_choice: openaiBody.tool_choice || "auto",
+        prompt_cache_key: openaiBody.user,
+        // Always stream upstream — we buffer on our side when the client asked for non-streaming.
+        stream: true,
+        reasoning: { effort },
+        store: false,
+        stream_options: { include_obfuscation: false },
+    };
+    if (["auto", "detailed", "concise"].includes(GPT_CONFIG.SUMMARY_LEVEL)) {
+        body.reasoning.summary = GPT_CONFIG.SUMMARY_LEVEL;
+    }
+    if (["low", "high"].includes(GPT_CONFIG.VERBOSITY_LEVEL)) {
+        body.text = { verbosity: GPT_CONFIG.VERBOSITY_LEVEL };
+    }
+    if (GPT_CONFIG.TRUNCATION === "auto") body.truncation = "auto";
+    return body;
+}
+
+function createResponsesStreamState(modelId) {
+    return {
+        chatId: "chatcmpl-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36),
+        model: modelId,
+        thinking: false,
+        toolCalls: 0,
+        // Buffers for non-streaming clients
+        bufferedContent: "",
+        bufferedToolCalls: [], // [{id, type:"function", function:{name, arguments}}]
+        finishReason: null,
+        failed: null,
+    };
+}
+
+function responsesChunk(state, delta, finishReason) {
+    return {
+        id: state.chatId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: state.model,
+        choices: [{ index: 0, delta: delta || {}, finish_reason: finishReason ?? null }],
+    };
+}
+
+// Centralized events that should close a <think> block before handling the next event
+const RESPONSES_THINKING_STOP_EVENTS = new Set([
+    "response.output_text.delta",
+    "response.output_item.added",
+]);
+
+// Convert a single Azure Responses SSE event into zero or more OpenAI chunks.
+// Mirrors ResponseAdapter in Cursor-Azure-GPT-5/app/azure/response_adapter.py.
+function translateResponsesEvent(eventName, obj, state) {
+    const out = [];
+
+    // Close any open <think> block when a non-reasoning event starts
+    if (state.thinking && RESPONSES_THINKING_STOP_EVENTS.has(eventName)) {
+        if (GPT_CONFIG.EMIT_THINK_TAGS) {
+            out.push(responsesChunk(state, { role: "assistant", content: "</think>\n\n" }));
+            state.bufferedContent += "</think>\n\n";
+        }
+        state.thinking = false;
+    }
+
+    switch (eventName) {
+        case "response.output_item.added": {
+            const itemType = obj?.item?.type;
+            if (itemType === "reasoning") {
+                state.thinking = true;
+                if (GPT_CONFIG.EMIT_THINK_TAGS) {
+                    out.push(responsesChunk(state, { role: "assistant", content: "<think>\n\n" }));
+                    state.bufferedContent += "<think>\n\n";
+                }
+            } else if (itemType === "function_call") {
+                state.toolCalls += 1;
+                const name = obj.item.name || "";
+                const args = obj.item.arguments || "";
+                const callId = obj.item.call_id || "";
+                out.push(responsesChunk(state, {
+                    role: "assistant",
+                    content: null,
+                    tool_calls: [{
+                        index: state.toolCalls - 1,
+                        id: callId,
+                        type: "function",
+                        function: { name, arguments: args },
+                    }],
+                }));
+                state.bufferedToolCalls.push({
+                    id: callId,
+                    type: "function",
+                    function: { name, arguments: args },
+                });
+            }
+            break;
+        }
+        case "response.function_call_arguments.delta": {
+            const d = typeof obj?.delta === "string" ? obj.delta : "";
+            out.push(responsesChunk(state, {
+                tool_calls: [{ index: state.toolCalls - 1, function: { arguments: d } }],
+            }));
+            const last = state.bufferedToolCalls[state.bufferedToolCalls.length - 1];
+            if (last) last.function.arguments = (last.function.arguments || "") + d;
+            break;
+        }
+        case "response.reasoning_summary_text.delta": {
+            const d = typeof obj?.delta === "string" ? obj.delta : "";
+            out.push(responsesChunk(state, { role: "assistant", content: d }));
+            state.bufferedContent += d;
+            break;
+        }
+        case "response.reasoning_summary_text.done": {
+            out.push(responsesChunk(state, { role: "assistant", content: "\n\n" }));
+            state.bufferedContent += "\n\n";
+            break;
+        }
+        case "response.output_text.delta": {
+            const d = typeof obj?.delta === "string" ? obj.delta : "";
+            out.push(responsesChunk(state, { role: "assistant", content: d }));
+            state.bufferedContent += d;
+            break;
+        }
+        case "response.failed": {
+            const err = obj?.response?.error || {};
+            const msg = `Azure Responses API error [${err.code || "unknown"}]: ${err.message || "no message"}`;
+            state.failed = msg;
+            out.push(responsesChunk(state, { role: "assistant", content: msg }));
+            state.bufferedContent += msg;
+            break;
+        }
+        default:
+            // ignore: response.created, response.in_progress, response.content_part.*,
+            // response.output_item.done, response.output_text.done, response.completed, …
+            break;
+    }
+    return out;
+}
+
+async function handleGptResponsesApi(req, res) {
+    const requestStart = Date.now();
+    const cursorModel = req.body?.model;
+    const effort = extractGptReasoningEffort(cursorModel);
+    const clientWantsStream = req.body?.stream === true;
+    const abortController = new AbortController();
+    let preStreamHeartbeat = null;
+
+    if (clientWantsStream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders();
+        res.write(": stream connected\n\n");
+        preStreamHeartbeat = setInterval(() => {
+            if (!res.writableEnded) {
+                try { res.write(": heartbeat\n\n"); } catch {}
+            }
+        }, 3000);
+    }
+    const clearHb = () => {
+        if (preStreamHeartbeat) { clearInterval(preStreamHeartbeat); preStreamHeartbeat = null; }
+    };
+
+    res.on("close", () => {
+        clearHb();
+        if (!res.writableFinished) {
+            console.log(`[GPT-RESP] Client disconnected after ${Date.now() - requestStart}ms, aborting upstream`);
+            abortController.abort();
+        }
+    });
+
+    try {
+        const body = buildResponsesBody(req.body, effort);
+        const url = buildGptResponsesUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.API_VERSION);
+        console.log(`[GPT-RESP] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${effort}, client_stream=${clientWantsStream}, tools=${body.tools?.length || 0}, input_items=${body.input?.length || 0}, summary=${body.reasoning.summary || "off"}, verbosity=${body.text?.verbosity || "default"}`);
+
+        const response = await axios.post(url, body, {
+            headers: {
+                "Content-Type": "application/json",
+                "api-key": GPT_CONFIG.API_KEY,
+            },
+            timeout: 300000,
+            responseType: "stream",
+            validateStatus: (s) => s < 600,
+            signal: abortController.signal,
+        });
+
+        console.log(`[GPT-RESP] Azure responded in ${Date.now() - requestStart}ms, status=${response.status}`);
+        clearHb();
+
+        if (response.status >= 400) {
+            const errorBody = await extractErrorFromResponse(response, true);
+            console.error(`[GPT-RESP ERROR] Azure ${response.status}:`, errorBody);
+            if (clientWantsStream) return writeSSEError(res, errorBody.error?.message || errorBody.message || "Azure Responses API error");
+            return res.status(response.status).json({
+                error: {
+                    message: errorBody.error?.message || errorBody.message || "Azure Responses API error",
+                    type: errorBody.error?.type || "api_error",
+                    code: response.status,
+                },
+            });
+        }
+
+        const state = createResponsesStreamState(cursorModel || GPT_CONFIG.DEPLOYMENT);
+        let sseBuffer = "";
+        let currentEvent = null;
+        let chunksForwarded = 0;
+        let eventsSeen = 0;
+
+        const writeIfStreaming = (chunk) => {
+            if (!clientWantsStream) return;
+            if (res.writableEnded) return;
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        };
+
+        const handleSsePayload = (eventName, payload) => {
+            eventsSeen += 1;
+            let obj = null;
+            try { obj = JSON.parse(payload); } catch { return; }
+            if (!eventName) eventName = obj?.type || null;
+            if (!eventName) return;
+            const chunks = translateResponsesEvent(eventName, obj, state);
+            for (const c of chunks) {
+                chunksForwarded += 1;
+                writeIfStreaming(c);
+            }
+        };
+
+        const processLines = (lines) => {
+            for (const rawLine of lines) {
+                const line = rawLine.replace(/\r$/, "");
+                if (line === "") {
+                    currentEvent = null;
+                    continue;
+                }
+                if (line.startsWith(":")) continue;
+                if (line.startsWith("event:")) {
+                    currentEvent = line.slice(6).trim();
+                    continue;
+                }
+                if (!line.startsWith("data:")) continue;
+                const payload = line.slice(5).trim();
+                if (!payload || payload === "[DONE]") continue;
+                handleSsePayload(currentEvent, payload);
+            }
+        };
+
+        response.data.on("data", (chunk) => {
+            sseBuffer += chunk.toString("utf8");
+            const lines = sseBuffer.split("\n");
+            sseBuffer = lines.pop() ?? "";
+            processLines(lines);
+        });
+
+        response.data.on("error", (err) => {
+            console.error("[GPT-RESP STREAM] Error:", err.message);
+            if (clientWantsStream && !res.writableEnded) {
+                try { writeSSEError(res, "Stream error: " + err.message); } catch {}
+            } else if (!res.headersSent) {
+                try { res.status(502).json({ error: { message: err.message, type: "upstream_error" } }); } catch {}
+            }
+        });
+
+        response.data.on("end", () => {
+            if (sseBuffer.trim().length > 0) {
+                processLines(sseBuffer.split("\n"));
+                sseBuffer = "";
+            }
+            // Close any dangling <think>
+            if (state.thinking && GPT_CONFIG.EMIT_THINK_TAGS) {
+                const closing = responsesChunk(state, { role: "assistant", content: "</think>\n\n" });
+                writeIfStreaming(closing);
+                state.bufferedContent += "</think>\n\n";
+                state.thinking = false;
+            }
+            const finishReason = state.toolCalls > 0 ? "tool_calls" : "stop";
+            state.finishReason = finishReason;
+
+            if (clientWantsStream) {
+                writeIfStreaming(responsesChunk(state, {}, finishReason));
+                if (!res.writableEnded) {
+                    try { res.write("data: [DONE]\n\n"); } catch {}
+                    try { res.end(); } catch {}
+                }
+                console.log(`[GPT-RESP STREAM] Done: events=${eventsSeen}, chunks=${chunksForwarded}, tool_calls=${state.toolCalls}, finish=${finishReason}`);
+            } else {
+                // Build a single non-streaming chat.completion response for Cursor
+                const message = { role: "assistant", content: state.bufferedContent || null };
+                if (state.bufferedToolCalls.length > 0) message.tool_calls = state.bufferedToolCalls;
+                const payload = {
+                    id: state.chatId,
+                    object: "chat.completion",
+                    created: Math.floor(Date.now() / 1000),
+                    model: state.model,
+                    choices: [{ index: 0, message, finish_reason: finishReason }],
+                    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                };
+                try { res.json(payload); } catch {}
+                console.log(`[GPT-RESP JSON] Done: events=${eventsSeen}, tool_calls=${state.toolCalls}, finish=${finishReason}, content_len=${state.bufferedContent.length}`);
+            }
+        });
+
+        res.on("close", () => {
+            if (typeof response.data.destroy === "function") {
+                try { response.data.destroy(); } catch {}
+            }
+        });
+    } catch (error) {
+        clearHb();
+        if (error.code === "ERR_CANCELED" || error.name === "CanceledError") {
+            console.log(`[GPT-RESP] Request aborted after ${Date.now() - requestStart}ms (client disconnected)`);
+            return;
+        }
+        console.error(`[GPT-RESP ERROR] After ${Date.now() - requestStart}ms:`, error.message);
+        if (clientWantsStream && !res.writableEnded) return writeSSEError(res, error.message);
+        if (res.headersSent) return;
+        if (error.response) {
+            return res.status(error.response.status).json({
+                error: { message: error.response.data?.error?.message || error.message, type: "api_error", code: error.response.status },
+            });
+        }
+        if (error.request) {
+            return res.status(503).json({ error: { message: "Unable to reach Azure Responses API: " + error.message, type: "connection_error" } });
+        }
+        return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
+    }
+}
+
 // ─── Azure OpenAI (GPT-5.4) Passthrough ─────────────────────────────────────
 //
 // gpt-5.4 supports the Chat Completions API natively (per Azure Foundry docs,
@@ -1237,6 +1679,22 @@ async function handleGptChatCompletions(req, res) {
 async function handleChatCompletions(req, res) {
     // Route GPT-family requests to Azure OpenAI; keep Claude on the Anthropic endpoint.
     if (isGptModel(req.body?.model)) {
+        // Short-circuit model-validation pings locally regardless of API mode,
+        // so Cursor's "Verify" flow works even if Azure Responses is slow or
+        // upstream creds are still being configured.
+        if (isModelValidationPing(req.body)) {
+            console.log(`[GPT] Model validation ping (model=${req.body.model}), responding locally`);
+            return res.json(makeValidationResponse(req.body.model || GPT_CONFIG.DEPLOYMENT));
+        }
+        if (GPT_CONFIG.API_MODE === "responses") {
+            if (!GPT_CONFIG.SHAPE) {
+                return res.status(500).json({ error: { message: "AZURE_OPENAI_ENDPOINT not configured", type: "configuration_error" } });
+            }
+            if (!GPT_CONFIG.API_KEY) {
+                return res.status(500).json({ error: { message: "AZURE_OPENAI_API_KEY / AZURE_API_KEY not configured", type: "configuration_error" } });
+            }
+            return handleGptResponsesApi(req, res);
+        }
         return handleGptChatCompletions(req, res);
     }
 
@@ -1639,10 +2097,16 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
     if (GPT_CONFIG.SHAPE) {
-        const resolvedUrl = buildGptUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.DEPLOYMENT, GPT_CONFIG.API_VERSION);
+        const chatUrl = buildGptUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.DEPLOYMENT, GPT_CONFIG.API_VERSION);
+        const respUrl = buildGptResponsesUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.API_VERSION);
+        const activeUrl = GPT_CONFIG.API_MODE === "responses" ? respUrl : chatUrl;
         console.log(`GPT Default Deployment: ${GPT_CONFIG.DEPLOYMENT} (AZURE_GPT_DEPLOYMENT)`);
         console.log(`GPT Model Map (cursor_id → reasoning_effort): ${JSON.stringify(GPT_MODEL_MAP)}`);
-        console.log(`GPT Endpoint: ${resolvedUrl} [style=${GPT_CONFIG.SHAPE.style}, api-version=${GPT_CONFIG.SHAPE.style === "v1" ? "preview" : GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]`);
+        console.log(`GPT API Mode: ${GPT_CONFIG.API_MODE} (AZURE_GPT_API_MODE: chat | responses)`);
+        console.log(`GPT Endpoint: ${activeUrl} [mode=${GPT_CONFIG.API_MODE}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]`);
+        if (GPT_CONFIG.API_MODE === "responses") {
+            console.log(`GPT Responses Config: summary=${GPT_CONFIG.SUMMARY_LEVEL}, verbosity=${GPT_CONFIG.VERBOSITY_LEVEL}, truncation=${GPT_CONFIG.TRUNCATION}, emit_think_tags=${GPT_CONFIG.EMIT_THINK_TAGS}`);
+        }
     } else {
         console.log(`Azure OpenAI (GPT): disabled (AZURE_OPENAI_ENDPOINT not set)`);
     }
