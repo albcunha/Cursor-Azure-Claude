@@ -58,11 +58,53 @@ curl -X POST https://cursor-azure-claude-proxy-production.up.railway.app/chat/co
 
 Server yêu cầu các biến môi trường sau:
 
--   `AZURE_ENDPOINT` - Azure Anthropic API endpoint
+### Claude (Anthropic on Azure)
+
+-   `AZURE_ENDPOINT` - Azure Anthropic API endpoint (`.../anthropic/v1/messages`)
 -   `AZURE_API_KEY` - Azure API key
 -   `SERVICE_API_KEY` - Service API key dùng để xác thực request từ Cursor IDE (phải khớp với API Key trong Cursor Settings)
 -   `PORT` - Port để chạy server (mặc định: 3000)
 -   `AZURE_DEPLOYMENT_NAME` - Tên deployment trên Azure (mặc định: "claude-opus-4-5")
+
+### GPT-5.4 (Azure OpenAI) — optional
+
+Leave these unset to disable the GPT route; Claude routing keeps working either way.
+
+-   `AZURE_OPENAI_ENDPOINT` - Foundry base URL, e.g. `https://<resource>.services.ai.azure.com` (no path, no trailing slash)
+-   `AZURE_OPENAI_API_KEY` - Separate key for the OpenAI endpoint. Defaults to `AZURE_API_KEY` when both are on the same Foundry resource.
+-   `AZURE_OPENAI_API_VERSION` - Default `2025-04-01-preview` (supports gpt-5.4 chat completions + `reasoning_effort`)
+-   `AZURE_GPT_DEPLOYMENT` - Exact name of the gpt-5.4 deployment in your Azure resource. Default `gpt-5.4`
+-   `GPT_REASONING_EFFORT` - Fallback effort (`minimal` / `low` / `medium` / `high`) when Cursor sends the bare `gpt-5.4` id without a suffix. Default `medium`
+
+## 🤖 Using GPT-5.4 in Cursor
+
+Azure Foundry ships `gpt-5.4` with native Chat Completions support since 2026-03-05, so the proxy forwards Cursor's OpenAI request almost unchanged (only swapping the model name to the deployment, stripping `temperature`/`top_p`, and converting `max_tokens` → `max_completion_tokens`, as required by reasoning models).
+
+1. Deploy `gpt-5.4` in the same Foundry resource you use for Claude. Note that `gpt-5.4` and `gpt-5.4-pro` currently require [access registration](https://aka.ms/OAI/gpt53codexaccess) on Azure.
+2. Set the `AZURE_OPENAI_*` env vars above on Railway and redeploy.
+3. In **Cursor Settings → Models → Custom Models**, add any of these model ids. Each one maps to the same Azure deployment, only `reasoning_effort` changes:
+
+    | Cursor model id   | reasoning_effort |
+    | ----------------- | ---------------- |
+    | `gpt-5.4`         | falls back to `GPT_REASONING_EFFORT` (default `medium`) |
+    | `gpt-5.4-minimal` | `minimal`        |
+    | `gpt-5.4-low`     | `low`            |
+    | `gpt-5.4-medium`  | `medium`         |
+    | `gpt-5.4-high`    | `high`           |
+
+4. Keep the **OpenAI API Key** field set to your `SERVICE_API_KEY` and the base URL pointing at this proxy — both Claude and GPT-5.4 share the same proxy endpoint and auth key.
+
+### Quick smoke test
+
+```bash
+curl -X POST https://cursor-azure-claude-proxy-production.up.railway.app/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $SERVICE_API_KEY" \
+  -d '{
+    "model": "gpt-5.4-medium",
+    "messages": [{"role": "user", "content": "Say hi in one word."}]
+  }'
+```
 
 ## 📦 Installation
 

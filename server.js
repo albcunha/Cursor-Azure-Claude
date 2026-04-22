@@ -13,6 +13,17 @@ const CONFIG = {
     ANTHROPIC_VERSION: "2023-06-01",
 };
 
+// Azure OpenAI config for GPT-family models (gpt-5.4, etc.)
+// The Foundry resource is typically the same as the Anthropic one, but we keep
+// the OpenAI base URL as a separate env var so you can point elsewhere if needed.
+const GPT_CONFIG = {
+    ENDPOINT: process.env.AZURE_OPENAI_ENDPOINT, // e.g. https://<resource>.services.ai.azure.com
+    API_KEY: process.env.AZURE_OPENAI_API_KEY || process.env.AZURE_API_KEY,
+    API_VERSION: process.env.AZURE_OPENAI_API_VERSION || "2025-04-01-preview",
+    DEPLOYMENT: process.env.AZURE_GPT_DEPLOYMENT || "gpt-5.4",
+    DEFAULT_EFFORT: (process.env.GPT_REASONING_EFFORT || "medium").toLowerCase(),
+};
+
 // ─── Model Routing ───────────────────────────────────────────────────────────
 
 const MODEL_MAP = {
@@ -22,6 +33,23 @@ const MODEL_MAP = {
 };
 
 const DEFAULT_DEPLOYMENT = "claude-sonnet-4-6";
+
+// Reasoning-effort suffixes understood for gpt-5.4 (longest first for greedy match).
+const GPT_EFFORT_SUFFIXES = ["minimal", "medium", "high", "low"];
+
+function isGptModel(cursorModel) {
+    if (!cursorModel) return false;
+    return cursorModel.toLowerCase().startsWith("gpt-");
+}
+
+function extractGptReasoningEffort(cursorModel) {
+    if (!cursorModel) return GPT_CONFIG.DEFAULT_EFFORT;
+    const lower = cursorModel.toLowerCase();
+    for (const level of GPT_EFFORT_SUFFIXES) {
+        if (lower.endsWith(`-${level}`)) return level;
+    }
+    return GPT_CONFIG.DEFAULT_EFFORT;
+}
 
 function resolveDeployment(cursorModel) {
     if (!cursorModel) return DEFAULT_DEPLOYMENT;
@@ -835,7 +863,171 @@ function writeSSEError(res, message, type = "proxy_error") {
     } catch {}
 }
 
+// ─── Azure OpenAI (GPT-5.4) Passthrough ─────────────────────────────────────
+//
+// gpt-5.4 supports the Chat Completions API natively (per Azure Foundry docs,
+// March 2026), so we can near-passthrough Cursor's OpenAI-format request. Only
+// tweaks: swap `model` → Azure deployment, convert max_tokens →
+// max_completion_tokens (required for reasoning models), strip temperature/top_p
+// (unsupported on reasoning models), and inject `reasoning_effort` from the
+// Cursor model-name suffix (e.g. gpt-5.4-high → "high").
+async function handleGptChatCompletions(req, res) {
+    const requestStart = Date.now();
+
+    if (!GPT_CONFIG.ENDPOINT) {
+        return res.status(500).json({
+            error: { message: "AZURE_OPENAI_ENDPOINT not configured", type: "configuration_error" },
+        });
+    }
+    if (!GPT_CONFIG.API_KEY) {
+        return res.status(500).json({
+            error: { message: "AZURE_OPENAI_API_KEY / AZURE_API_KEY not configured", type: "configuration_error" },
+        });
+    }
+
+    const cursorModel = req.body?.model;
+
+    // Fast-path validation pings (same logic as Anthropic route)
+    if (isModelValidationPing(req.body)) {
+        console.log(`[GPT] Model validation ping (model=${cursorModel}), responding locally`);
+        return res.json(makeValidationResponse(cursorModel || GPT_CONFIG.DEPLOYMENT));
+    }
+
+    const effort = extractGptReasoningEffort(cursorModel);
+    const isStreaming = req.body?.stream === true;
+    const abortController = new AbortController();
+    let preStreamHeartbeat = null;
+
+    if (isStreaming) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders();
+        res.write(": stream connected\n\n");
+        preStreamHeartbeat = setInterval(() => {
+            if (!res.writableEnded) {
+                try { res.write(": heartbeat\n\n"); } catch {}
+            }
+        }, 3000);
+    }
+
+    function clearPreStreamHeartbeat() {
+        if (preStreamHeartbeat) {
+            clearInterval(preStreamHeartbeat);
+            preStreamHeartbeat = null;
+        }
+    }
+
+    res.on("close", () => {
+        clearPreStreamHeartbeat();
+        if (!res.writableFinished) {
+            console.log(`[GPT] Client disconnected after ${Date.now() - requestStart}ms, aborting upstream`);
+            abortController.abort();
+        }
+    });
+
+    try {
+        const upstreamBody = { ...req.body };
+        upstreamBody.model = GPT_CONFIG.DEPLOYMENT;
+
+        // Reasoning models require max_completion_tokens (max_tokens is deprecated for them)
+        if (upstreamBody.max_tokens != null && upstreamBody.max_completion_tokens == null) {
+            upstreamBody.max_completion_tokens = upstreamBody.max_tokens;
+        }
+        delete upstreamBody.max_tokens;
+
+        // Unsupported sampling params on gpt-5.x reasoning models
+        delete upstreamBody.temperature;
+        delete upstreamBody.top_p;
+        delete upstreamBody.presence_penalty;
+        delete upstreamBody.frequency_penalty;
+
+        if (!upstreamBody.reasoning_effort) {
+            upstreamBody.reasoning_effort = effort;
+        }
+
+        const base = GPT_CONFIG.ENDPOINT.replace(/\/+$/, "");
+        const url = `${base}/openai/deployments/${encodeURIComponent(GPT_CONFIG.DEPLOYMENT)}/chat/completions?api-version=${encodeURIComponent(GPT_CONFIG.API_VERSION)}`;
+
+        console.log(`[GPT] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${upstreamBody.reasoning_effort}, stream=${isStreaming}, tools=${upstreamBody.tools?.length || 0}, messages=${upstreamBody.messages?.length || 0}`);
+
+        const response = await axios.post(url, upstreamBody, {
+            headers: {
+                "Content-Type": "application/json",
+                "api-key": GPT_CONFIG.API_KEY,
+            },
+            timeout: 300000,
+            responseType: isStreaming ? "stream" : "json",
+            validateStatus: (s) => s < 600,
+            signal: abortController.signal,
+        });
+
+        const azureElapsed = Date.now() - requestStart;
+        console.log(`[GPT] Azure responded in ${azureElapsed}ms, status=${response.status}`);
+        clearPreStreamHeartbeat();
+
+        if (response.status >= 400) {
+            const errorBody = await extractErrorFromResponse(response, isStreaming);
+            console.error(`[GPT ERROR] Azure ${response.status}:`, errorBody);
+            if (isStreaming) {
+                return writeSSEError(res, errorBody.error?.message || errorBody.message || "Azure OpenAI error");
+            }
+            return res.status(response.status).json({
+                error: {
+                    message: errorBody.error?.message || errorBody.message || "Azure OpenAI error",
+                    type: errorBody.error?.type || "api_error",
+                    code: response.status,
+                },
+            });
+        }
+
+        if (isStreaming) {
+            // Both sides speak OpenAI SSE format — straight pipe is safe.
+            response.data.on("error", (err) => {
+                console.error("[GPT STREAM] Error:", err.message);
+                if (!res.writableEnded) {
+                    try { res.end(); } catch {}
+                }
+            });
+            res.on("close", () => {
+                if (typeof response.data.destroy === "function") {
+                    try { response.data.destroy(); } catch {}
+                }
+            });
+            response.data.pipe(res);
+        } else {
+            res.json(response.data);
+        }
+    } catch (error) {
+        clearPreStreamHeartbeat();
+        if (error.code === "ERR_CANCELED" || error.name === "CanceledError") {
+            console.log(`[GPT] Request aborted after ${Date.now() - requestStart}ms (client disconnected)`);
+            return;
+        }
+        console.error(`[GPT ERROR] After ${Date.now() - requestStart}ms:`, error.message);
+        if (isStreaming && !res.writableEnded) {
+            return writeSSEError(res, error.message);
+        }
+        if (res.headersSent) return;
+        if (error.response) {
+            return res.status(error.response.status).json({
+                error: { message: error.response.data?.error?.message || error.message, type: "api_error", code: error.response.status },
+            });
+        }
+        if (error.request) {
+            return res.status(503).json({ error: { message: "Unable to reach Azure OpenAI: " + error.message, type: "connection_error" } });
+        }
+        return res.status(500).json({ error: { message: error.message, type: "proxy_error" } });
+    }
+}
+
 async function handleChatCompletions(req, res) {
+    // Route GPT-family requests to Azure OpenAI; keep Claude on the Anthropic endpoint.
+    if (isGptModel(req.body?.model)) {
+        return handleGptChatCompletions(req, res);
+    }
+
     const requestStart = Date.now();
 
     // Fast-path: respond instantly to Cursor's model-validation pings
@@ -1103,6 +1295,17 @@ function getModelList() {
             models.push({ id: deployment, object: "model", created: 1700000000, owned_by: "azure-anthropic" });
         }
     }
+    // Advertise the gpt-5.4 reasoning-effort variants when an Azure OpenAI
+    // endpoint is configured. The base id can still be used without a suffix.
+    if (GPT_CONFIG.ENDPOINT) {
+        const gptIds = ["gpt-5.4", "gpt-5.4-minimal", "gpt-5.4-low", "gpt-5.4-medium", "gpt-5.4-high"];
+        for (const id of gptIds) {
+            if (!seen.has(id)) {
+                seen.add(id);
+                models.push({ id, object: "model", created: 1700000000, owned_by: "azure-openai" });
+            }
+        }
+    }
     return { object: "list", data: models };
 }
 
@@ -1221,6 +1424,7 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`Min Output Tokens: ${MIN_OUTPUT_TOKENS}`);
     console.log(`API Key: ${CONFIG.AZURE_API_KEY ? "configured" : "MISSING"}`);
     console.log(`Auth Key: ${CONFIG.SERVICE_API_KEY ? "configured" : "MISSING"}`);
+    console.log(`Azure OpenAI (GPT): ${GPT_CONFIG.ENDPOINT ? `${GPT_CONFIG.ENDPOINT} [deployment=${GPT_CONFIG.DEPLOYMENT}, api-version=${GPT_CONFIG.API_VERSION}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]` : "disabled (AZURE_OPENAI_ENDPOINT not set)"}`);
     console.log(`LOG_TOOL_CALLS: ${LOG_TOOL_CALLS}`);
     console.log(`LOG_MESSAGES: ${LOG_MESSAGES}`);
     console.log("=".repeat(60));
