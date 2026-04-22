@@ -259,6 +259,7 @@ function convertMessagesToAnthropic(openaiMessages) {
                 }
             }
 
+            
             // Standard OpenAI tool_calls field
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 for (const tc of msg.tool_calls) {
