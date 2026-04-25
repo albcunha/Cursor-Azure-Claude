@@ -108,6 +108,10 @@ const GPT_CONFIG = (() => {
 // version (e.g. AZURE_CLAUDE_DEPLOYMENT_NAME=claude-opus-4-7). AZURE_CLAUDE_DEPLOYMENT_NAME
 // acts as the overall default; per-family vars override when set.
 const CLAUDE_DEFAULT = process.env.AZURE_CLAUDE_DEPLOYMENT_NAME || "claude-opus-4-6";
+const CLAUDE_DIRECT_DEPLOYMENTS = (process.env.AZURE_CLAUDE_DEPLOYMENTS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
 const MODEL_MAP = {
     "opus":   process.env.AZURE_CLAUDE_OPUS_DEPLOYMENT   || CLAUDE_DEFAULT,
@@ -148,7 +152,14 @@ function resolveDeployment(cursorModel) {
     if (!cursorModel) return DEFAULT_DEPLOYMENT;
     const lower = cursorModel.toLowerCase();
 
-    // Direct match in MODEL_MAP families
+    // If Cursor sends a concrete Azure Claude deployment name, use it directly.
+    // This lets "claude-opus-4-6" and "claude-opus-4-7" target different
+    // deployments without being rewritten through the opus family default.
+    if (/^claude-[a-z0-9]+(?:-[a-z0-9]+)*-\d+(?:[.-]\d+)*$/i.test(cursorModel)) {
+        return cursorModel;
+    }
+
+    // Direct match in MODEL_MAP families / aliases
     for (const [family, deployment] of Object.entries(MODEL_MAP)) {
         if (lower.includes(family)) return deployment;
     }
@@ -1997,10 +2008,18 @@ app.post("/v1/chat/completions", requireAuth, handleChatCompletions);
 function getModelList() {
     const models = [];
     const seen = new Set();
-    for (const deployment of Object.values(MODEL_MAP)) {
+    const claudeModels = [
+        ...Object.values(MODEL_MAP),
+        ...CLAUDE_DIRECT_DEPLOYMENTS,
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+    ];
+    for (const deployment of claudeModels) {
         if (!seen.has(deployment)) {
             seen.add(deployment);
-            models.push({ id: deployment, object: "model", created: 1700000000, owned_by: "azure-anthropic" });
+            // Cursor consumes this through its OpenAI-compatible custom-model path,
+            // so advertise Claude deployments as OpenAI-style model ids.
+            models.push({ id: deployment, object: "model", created: 1700000000, owned_by: "openai" });
         }
     }
     // Advertise the gpt-5.4 reasoning-effort variants when an Azure OpenAI
@@ -2009,7 +2028,7 @@ function getModelList() {
         for (const id of Object.keys(GPT_MODEL_MAP)) {
             if (!seen.has(id)) {
                 seen.add(id);
-                models.push({ id, object: "model", created: 1700000000, owned_by: "azure-openai" });
+                models.push({ id, object: "model", created: 1700000000, owned_by: "openai" });
             }
         }
     }
