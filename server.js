@@ -121,6 +121,13 @@ const MODEL_MAP = {
 
 const DEFAULT_DEPLOYMENT = CLAUDE_DEFAULT;
 
+const CLAUDE_ALIAS_MAP = {
+    "claudeopus-4-6": "claude-opus-4-6",
+    "claudeopus-4-7": "claude-opus-4-7",
+    "opus46": "claude-opus-4-6",
+    "opus47": "claude-opus-4-7",
+};
+
 // Reasoning-effort suffixes understood for gpt-5.4 (longest first for greedy match).
 const GPT_EFFORT_SUFFIXES = ["minimal", "medium", "high", "low"];
 
@@ -151,6 +158,15 @@ function extractGptReasoningEffort(cursorModel) {
 function resolveDeployment(cursorModel) {
     if (!cursorModel) return DEFAULT_DEPLOYMENT;
     const lower = cursorModel.toLowerCase();
+
+    if (CLAUDE_ALIAS_MAP[lower]) {
+        return CLAUDE_ALIAS_MAP[lower];
+    }
+
+    const compactClaudeMatch = lower.match(/^claude(opus|sonnet|haiku)-(.+)$/);
+    if (compactClaudeMatch) {
+        return `claude-${compactClaudeMatch[1]}-${compactClaudeMatch[2]}`;
+    }
 
     // If Cursor sends a concrete Azure Claude deployment name, use it directly.
     // This lets "claude-opus-4-6" and "claude-opus-4-7" target different
@@ -994,12 +1010,20 @@ function writeSSEError(res, message, type = "proxy_error") {
 function contentToText(content) {
     if (content == null) return "";
     if (typeof content === "string") return content;
+    if (!Array.isArray(content) && typeof content === "object") {
+        if (typeof content.text === "string") return content.text;
+        if (typeof content.input_text === "string") return content.input_text;
+        if (typeof content.output_text === "string") return content.output_text;
+    }
     if (!Array.isArray(content)) return String(content);
     const parts = [];
     for (const part of content) {
         if (part && typeof part === "object") {
-            if (part.type === "text") parts.push(part.text || "");
+            if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+                parts.push(part.text || "");
+            }
             else if (part.type === "image_url") parts.push("[image]");
+            else if (typeof part.text === "string") parts.push(part.text);
             else parts.push(`[${part.type || "unknown"}]`);
         } else {
             parts.push(String(part));
@@ -2011,6 +2035,7 @@ function getModelList() {
     const claudeModels = [
         ...Object.values(MODEL_MAP),
         ...CLAUDE_DIRECT_DEPLOYMENTS,
+        ...Object.keys(CLAUDE_ALIAS_MAP),
         "claude-opus-4-6",
         "claude-opus-4-7",
     ];
