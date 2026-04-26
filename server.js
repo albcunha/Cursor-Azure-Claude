@@ -1811,8 +1811,9 @@ async function handleChatCompletions(req, res) {
     // Fast-path: respond instantly to Cursor's model-validation pings
     // (non-streaming, no tools, 1-2 messages) to prevent disconnect during Azure cold start
     if (isModelValidationPing(req.body)) {
-        console.log(`[PROXY] Model validation ping (model=${req.body.model}, stream=${req.body.stream}), responding locally`);
-        return res.json(makeValidationResponse(req.body.model || DEFAULT_DEPLOYMENT));
+        const validationModel = resolveDeployment(req.body.model);
+        console.log(`[PROXY] Model validation ping (model=${req.body.model} → ${validationModel}), responding locally`);
+        return res.json(makeValidationResponse(validationModel));
     }
 
     const abortController = new AbortController();
@@ -1913,6 +1914,12 @@ async function handleChatCompletions(req, res) {
         }
 
         const anthropicRequest = buildAnthropicRequest(req.body);
+        // Use the resolved deployment name (e.g. "claude-opus-4-6") in responses
+        // back to Cursor, NOT the raw alias (e.g. "opus46"). Cursor stores the
+        // model id from responses and uses it for internal operations like resuming
+        // chats after background tasks. Aliases like "opus46" are not recognized
+        // by Cursor's own model resolver and cause "AI model not found" errors.
+        const responseModelId = anthropicRequest.model;
 
         console.log(`[PROXY] ── Request ──────────────────────────────────`);
         console.log(`[PROXY] cursor_model=${req.body.model} → deployment=${anthropicRequest.model}`);
@@ -1997,10 +2004,10 @@ async function handleChatCompletions(req, res) {
         }
 
         if (isStreaming) {
-            handleAnthropicStream(response, res, req.body.model, abortController, true);
+            handleAnthropicStream(response, res, responseModelId, abortController, true);
         } else {
             const anthropicStopReason = response.data?.stop_reason;
-            const openaiResponse = convertAnthropicResponseToOpenai(response.data, req.body.model);
+            const openaiResponse = convertAnthropicResponseToOpenai(response.data, responseModelId);
             console.log(`[RESPONSE] anthropic_stop=${anthropicStopReason} → finish_reason=${openaiResponse.choices[0].finish_reason}, tool_calls=${openaiResponse.choices[0].message.tool_calls?.length || 0}, usage=${JSON.stringify(openaiResponse.usage)}`);
             if (anthropicStopReason === "max_tokens") {
                 console.log(`[RESPONSE] ⚠️  OUTPUT TRUNCATED — model hit max_tokens. cursor_max_tokens=${req.body.max_tokens || 'not set'}, actual=${anthropicRequest.max_tokens}`);
@@ -2067,10 +2074,13 @@ app.post("/v1/chat/completions", requireAuth, handleChatCompletions);
 function getModelList() {
     const models = [];
     const seen = new Set();
+    // Advertise resolved deployment names, NOT raw aliases (e.g. "opus46").
+    // Cursor stores the model id from responses and uses it for internal
+    // operations; unrecognized aliases cause "AI model not found" on resume.
     const claudeModels = [
         ...Object.values(MODEL_MAP),
         ...CLAUDE_DIRECT_DEPLOYMENTS,
-        ...Object.keys(CLAUDE_ALIAS_MAP),
+        ...Object.values(CLAUDE_ALIAS_MAP),
         "claude-opus-4-6",
         "claude-opus-4-7",
     ];
