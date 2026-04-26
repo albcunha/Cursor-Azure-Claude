@@ -1032,6 +1032,42 @@ function contentToText(content) {
     return parts.join("\n");
 }
 
+function contentToResponsesParts(content, role) {
+    const textType = role === "assistant" ? "output_text" : "input_text";
+    if (content == null) return [{ type: textType, text: "" }];
+    if (typeof content === "string") return [{ type: textType, text: content }];
+    if (!Array.isArray(content)) return [{ type: textType, text: contentToText(content) }];
+
+    const parts = [];
+    for (const part of content) {
+        if (!part || typeof part !== "object") {
+            parts.push({ type: textType, text: String(part) });
+            continue;
+        }
+        if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+            parts.push({ type: textType, text: part.text || "" });
+            continue;
+        }
+        if (part.type === "image_url" && role === "user") {
+            const imageUrl = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+            if (imageUrl) {
+                parts.push({ type: "input_image", image_url: imageUrl });
+                continue;
+            }
+        }
+        if (part.type === "input_image" && role === "user") {
+            const imagePart = { type: "input_image" };
+            if (part.image_url) imagePart.image_url = part.image_url;
+            if (part.file_id) imagePart.file_id = part.file_id;
+            if (part.detail) imagePart.detail = part.detail;
+            parts.push(imagePart);
+            continue;
+        }
+        parts.push({ type: textType, text: contentToText([part]) });
+    }
+    return parts.length ? parts : [{ type: textType, text: "" }];
+}
+
 function convertMessagesToResponsesInput(messages) {
     const instructionsParts = [];
     const input = [];
@@ -1052,10 +1088,9 @@ function convertMessagesToResponsesInput(messages) {
             continue;
         }
         // user / assistant / anything else → text turn
-        const text = contentToText(m.content);
         input.push({
             role: role || "user",
-            content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+            content: contentToResponsesParts(m.content, role || "user"),
         });
         if (Array.isArray(m.tool_calls)) {
             for (const tc of m.tool_calls) {
