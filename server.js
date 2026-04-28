@@ -128,7 +128,7 @@ const CLAUDE_ALIAS_MAP = {
     "opus47": "claude-opus-4-7",
 };
 
-// Reasoning-effort suffixes understood for gpt-5.4 (longest first for greedy match).
+// Reasoning-effort suffixes understood for gpt-5.x (longest first for greedy match).
 const GPT_EFFORT_SUFFIXES = ["minimal", "medium", "high", "low"];
 
 // Cursor-facing gpt-5.4 model ids and the reasoning_effort each resolves to.
@@ -141,9 +141,57 @@ const GPT_MODEL_MAP = {
     "gpt-5.4-high":     "high",
 };
 
+// GPT alias map: short names → { deployment, displayName }.
+// Similar to CLAUDE_ALIAS_MAP but with per-alias deployment support since
+// different GPT models may target different Azure deployments.
+// Effort suffixes (-low, -medium, -high, -minimal) are stripped before lookup
+// and still control reasoning_effort independently.
+const GPT_ALIAS_MAP = {
+    "gpt55":  { deployment: "gpt55",  displayName: "gpt-5.5" },
+    "gpt-55": { deployment: "gpt55",  displayName: "gpt-5.5" },
+};
+
+// Populate GPT_MODEL_MAP with alias display names so they get effort variants
+for (const [, { displayName }] of Object.entries(GPT_ALIAS_MAP)) {
+    if (!GPT_MODEL_MAP[displayName]) {
+        GPT_MODEL_MAP[displayName] = GPT_CONFIG.DEFAULT_EFFORT;
+        for (const level of GPT_EFFORT_SUFFIXES) {
+            GPT_MODEL_MAP[`${displayName}-${level}`] = level;
+        }
+    }
+}
+
 function isGptModel(cursorModel) {
     if (!cursorModel) return false;
-    return cursorModel.toLowerCase().startsWith("gpt-");
+    const lower = cursorModel.toLowerCase();
+    if (lower.startsWith("gpt-") || lower.startsWith("gpt5")) return true;
+    // Strip effort suffix before alias lookup
+    const base = lower.replace(/-(?:minimal|low|medium|high)$/, "");
+    return !!GPT_ALIAS_MAP[base];
+}
+
+// Resolve a Cursor-facing GPT model name to the Azure deployment name.
+// Aliases like "gpt55" resolve to their configured deployment; standard
+// names like "gpt-5.4" fall back to GPT_CONFIG.DEPLOYMENT.
+function resolveGptDeployment(cursorModel) {
+    if (!cursorModel) return GPT_CONFIG.DEPLOYMENT;
+    const lower = cursorModel.toLowerCase();
+    const base = lower.replace(/-(?:minimal|low|medium|high)$/, "");
+    const alias = GPT_ALIAS_MAP[base];
+    if (alias) return alias.deployment;
+    return GPT_CONFIG.DEPLOYMENT;
+}
+
+// Resolve a Cursor-facing GPT model name to the canonical display name
+// (e.g. "gpt55" → "gpt-5.5", "gpt-5.4-high" → "gpt-5.4").
+// This is echoed back to Cursor so it stores a recognizable model id.
+function resolveGptDisplayName(cursorModel) {
+    if (!cursorModel) return GPT_CONFIG.DEPLOYMENT;
+    const lower = cursorModel.toLowerCase();
+    const base = lower.replace(/-(?:minimal|low|medium|high)$/, "");
+    const alias = GPT_ALIAS_MAP[base];
+    if (alias) return alias.displayName;
+    return cursorModel;
 }
 
 function extractGptReasoningEffort(cursorModel) {
@@ -1127,7 +1175,7 @@ function convertToolsToResponses(openaiTools) {
     return out;
 }
 
-function buildResponsesBody(openaiBody, effort) {
+function buildResponsesBody(openaiBody, effort, deployment) {
     const { instructions, input } = convertMessagesToResponsesInput(openaiBody.messages || []);
 
     // Azure rejects `input: null` with "expected a string, but got an object".
@@ -1139,7 +1187,7 @@ function buildResponsesBody(openaiBody, effort) {
         : [{ role: "user", content: [{ type: "input_text", text: "" }] }];
 
     const body = {
-        model: GPT_CONFIG.DEPLOYMENT,
+        model: deployment || GPT_CONFIG.DEPLOYMENT,
         input: safeInput,
         tools: convertToolsToResponses(openaiBody.tools || []),
         tool_choice: openaiBody.tool_choice || "auto",
@@ -1287,6 +1335,8 @@ async function handleGptResponsesApi(req, res) {
     const requestStart = Date.now();
     const cursorModel = req.body?.model;
     const effort = extractGptReasoningEffort(cursorModel);
+    const gptDeployment = resolveGptDeployment(cursorModel);
+    const gptDisplayName = resolveGptDisplayName(cursorModel);
     const clientWantsStream = req.body?.stream === true;
     const abortController = new AbortController();
     let preStreamHeartbeat = null;
@@ -1317,7 +1367,7 @@ async function handleGptResponsesApi(req, res) {
     });
 
     try {
-        const body = buildResponsesBody(req.body, effort);
+        const body = buildResponsesBody(req.body, effort, gptDeployment);
         const url = buildGptResponsesUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.API_VERSION);
 
         // Raw-body summary so we can see what Cursor sent (roles, content shapes)
@@ -1333,7 +1383,7 @@ async function handleGptResponsesApi(req, res) {
             }, {});
             console.log(`[GPT-RESP RAW] messages=${rawMsgs.length}, roles=${JSON.stringify(roleCounts)}, has_tools=${Array.isArray(req.body?.tools) && req.body.tools.length > 0}, has_tool_choice=${!!req.body?.tool_choice}, has_instructions=${!!body.instructions}`);
         }
-        console.log(`[GPT-RESP] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${effort}, client_stream=${clientWantsStream}, tools=${body.tools?.length || 0}, input_items=${body.input.length} [${inputSummary}], summary=${body.reasoning.summary || "off"}, verbosity=${body.text?.verbosity || "default"}`);
+        console.log(`[GPT-RESP] cursor_model=${cursorModel} → deployment=${gptDeployment}, display=${gptDisplayName}, effort=${effort}, client_stream=${clientWantsStream}, tools=${body.tools?.length || 0}, input_items=${body.input.length} [${inputSummary}], summary=${body.reasoning.summary || "off"}, verbosity=${body.text?.verbosity || "default"}`);
 
         const response = await axios.post(url, body, {
             headers: {
@@ -1373,7 +1423,7 @@ async function handleGptResponsesApi(req, res) {
             });
         }
 
-        const state = createResponsesStreamState(cursorModel || GPT_CONFIG.DEPLOYMENT);
+        const state = createResponsesStreamState(gptDisplayName);
         let sseBuffer = "";
         let currentEvent = null;
         let chunksForwarded = 0;
@@ -1521,11 +1571,13 @@ async function handleGptChatCompletions(req, res) {
     }
 
     const cursorModel = req.body?.model;
+    const gptDeployment = resolveGptDeployment(cursorModel);
+    const gptDisplayName = resolveGptDisplayName(cursorModel);
 
     // Fast-path validation pings (same logic as Anthropic route)
     if (isModelValidationPing(req.body)) {
-        console.log(`[GPT] Model validation ping (model=${cursorModel}), responding locally`);
-        return res.json(makeValidationResponse(cursorModel || GPT_CONFIG.DEPLOYMENT));
+        console.log(`[GPT] Model validation ping (model=${cursorModel} → ${gptDisplayName}), responding locally`);
+        return res.json(makeValidationResponse(gptDisplayName));
     }
 
     const effort = extractGptReasoningEffort(cursorModel);
@@ -1564,7 +1616,7 @@ async function handleGptChatCompletions(req, res) {
 
     try {
         const upstreamBody = { ...req.body };
-        upstreamBody.model = GPT_CONFIG.DEPLOYMENT;
+        upstreamBody.model = gptDeployment;
 
         // Reasoning models require max_completion_tokens (max_tokens is deprecated for them)
         if (upstreamBody.max_tokens != null && upstreamBody.max_completion_tokens == null) {
@@ -1582,9 +1634,9 @@ async function handleGptChatCompletions(req, res) {
             upstreamBody.reasoning_effort = effort;
         }
 
-        const url = buildGptUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.DEPLOYMENT, GPT_CONFIG.API_VERSION);
+        const url = buildGptUrl(GPT_CONFIG.SHAPE, gptDeployment, GPT_CONFIG.API_VERSION);
 
-        console.log(`[GPT] cursor_model=${cursorModel} → deployment=${GPT_CONFIG.DEPLOYMENT}, effort=${upstreamBody.reasoning_effort}, stream=${isStreaming}, tools=${upstreamBody.tools?.length || 0}, messages=${upstreamBody.messages?.length || 0}, api_style=${GPT_CONFIG.SHAPE.style}`);
+        console.log(`[GPT] cursor_model=${cursorModel} → deployment=${gptDeployment}, display=${gptDisplayName}, effort=${upstreamBody.reasoning_effort}, stream=${isStreaming}, tools=${upstreamBody.tools?.length || 0}, messages=${upstreamBody.messages?.length || 0}, api_style=${GPT_CONFIG.SHAPE.style}`);
 
         const response = await axios.post(url, upstreamBody, {
             headers: {
@@ -1626,7 +1678,7 @@ async function handleGptChatCompletions(req, res) {
             //   3) sprays extra fields (`content_filter_results`, `obfuscation`,
             //      `service_tier`, `system_fingerprint`, `prompt_filter_results`).
             // This sanitizer fixes all three line-by-line before forwarding.
-            const originalModelId = cursorModel || GPT_CONFIG.DEPLOYMENT;
+            const originalModelId = gptDisplayName;
             let sseBuffer = "";
             let prologueDropped = false;
             let chunksForwarded = 0;
@@ -1738,7 +1790,7 @@ async function handleGptChatCompletions(req, res) {
                 }
             });
         } else {
-            const originalModelId = cursorModel || GPT_CONFIG.DEPLOYMENT;
+            const originalModelId = gptDisplayName;
             const sanitized = { ...response.data };
             delete sanitized.prompt_filter_results;
             delete sanitized.system_fingerprint;
@@ -1791,8 +1843,9 @@ async function handleChatCompletions(req, res) {
         // so Cursor's "Verify" flow works even if Azure Responses is slow or
         // upstream creds are still being configured.
         if (isModelValidationPing(req.body)) {
-            console.log(`[GPT] Model validation ping (model=${req.body.model}), responding locally`);
-            return res.json(makeValidationResponse(req.body.model || GPT_CONFIG.DEPLOYMENT));
+            const pingDisplayName = resolveGptDisplayName(req.body.model);
+            console.log(`[GPT] Model validation ping (model=${req.body.model} → ${pingDisplayName}), responding locally`);
+            return res.json(makeValidationResponse(pingDisplayName));
         }
         if (GPT_CONFIG.API_MODE === "responses") {
             if (!GPT_CONFIG.SHAPE) {
@@ -2228,6 +2281,7 @@ const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
         const respUrl = buildGptResponsesUrl(GPT_CONFIG.SHAPE, GPT_CONFIG.API_VERSION);
         const activeUrl = GPT_CONFIG.API_MODE === "responses" ? respUrl : chatUrl;
         console.log(`GPT Default Deployment: ${GPT_CONFIG.DEPLOYMENT} (AZURE_GPT_DEPLOYMENT)`);
+        console.log(`GPT Alias Map: ${JSON.stringify(Object.fromEntries(Object.entries(GPT_ALIAS_MAP).map(([k, v]) => [k, `${v.displayName} → deploy:${v.deployment}`])))}`);
         console.log(`GPT Model Map (cursor_id → reasoning_effort): ${JSON.stringify(GPT_MODEL_MAP)}`);
         console.log(`GPT API Mode: ${GPT_CONFIG.API_MODE} (AZURE_GPT_API_MODE: chat | responses)`);
         console.log(`GPT Endpoint: ${activeUrl} [mode=${GPT_CONFIG.API_MODE}, default_effort=${GPT_CONFIG.DEFAULT_EFFORT}]`);
